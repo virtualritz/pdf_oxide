@@ -5,12 +5,15 @@
 use crate::document::PdfDocument;
 use crate::editor::form_fields::FormFieldWrapper;
 use crate::editor::resource_manager::ResourceManager;
-use crate::elements::{ContentElement, StructureElement};
+use crate::elements::{ContentElement, ImageContent, StructureElement};
 use crate::error::{Error, Result};
 use crate::extractors::HierarchicalExtractor;
 use crate::geometry::Rect;
 use crate::object::{Object, ObjectRef};
-use crate::writer::{hoist_appearance_streams, ContentStreamBuilder, ObjectSerializer};
+use crate::writer::{
+    hoist_appearance_streams, image_content_to_xobject_stream, ContentStreamBuilder,
+    ObjectSerializer, PendingImage,
+};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 #[cfg(not(target_arch = "wasm32"))]
@@ -164,6 +167,16 @@ pub struct PageInfo {
     pub rotation: i32,
     /// Object reference for this page
     pub object_ref: ObjectRef,
+}
+
+/// An image an overlay draws, and the object ids reserved to write it with.
+struct OverlayImage {
+    /// The XObject resource name the overlay content stream emitted, e.g. `Im1`.
+    resource_id: String,
+    id: u32,
+    /// Reserved whether or not the image turns out to carry an alpha channel.
+    soft_mask_id: u32,
+    image: ImageContent,
 }
 
 /// Options for saving the document.
@@ -2459,6 +2472,63 @@ impl DocumentEditor {
                                         None
                                     };
 
+                                // Streams in a /Contents array concatenate into one
+                                // stream (ISO 32000-1 s7.8.2), so an appended overlay
+                                // inherits whatever CTM the original content left in
+                                // force. Pages that open with e.g. `1 0 0 -1 0 792 cm`
+                                // and never restore it -- routine in Word and
+                                // LibreOffice exports -- would draw the overlay
+                                // flipped. No operator sets the CTM absolutely, so the
+                                // original is bracketed instead: the array becomes
+                                // [q, ...original, Q + overlay], which returns the
+                                // overlay to page space. One `q` object serves every
+                                // page that needs it.
+                                let overlay_save_id: Option<u32> =
+                                    overlay_additions_id.map(|_| self.allocate_object_id());
+
+                                // The overlay stream is generated here rather than at
+                                // its write site further down, because the images it
+                                // references have to be registered in this page's
+                                // /Resources/XObject, and the page dictionary is
+                                // serialized before that write site is reached.
+                                // Generating once here yields both the bytes and the
+                                // images, so the resource names never have to be
+                                // predicted from `next_image_id`.
+                                let overlay_content: Option<(Vec<u8>, Vec<PendingImage>)> = self
+                                    .overlay_additions
+                                    .get(&source_page_index)
+                                    .and_then(|added| {
+                                        let wrapper = StructureElement {
+                                            structure_type: "Document".to_string(),
+                                            bbox: crate::geometry::Rect::new(0.0, 0.0, 0.0, 0.0),
+                                            children: added.clone(),
+                                            reading_order: None,
+                                            alt_text: None,
+                                            language: None,
+                                        };
+                                        self.generate_content_stream(&wrapper).ok()
+                                    });
+
+                                // An id per image the overlay draws, paired with the
+                                // resource name the stream actually emitted, plus an id
+                                // held for its soft mask -- an alpha channel is a second
+                                // stream that the image dictionary has to reference by
+                                // id, so it cannot be allocated at write time.
+                                let overlay_xobject_ids: Vec<OverlayImage> = overlay_content
+                                    .as_ref()
+                                    .map(|(_, pending)| {
+                                        pending
+                                            .iter()
+                                            .map(|pending| OverlayImage {
+                                                resource_id: pending.resource_id.clone(),
+                                                id: self.allocate_object_id(),
+                                                soft_mask_id: self.allocate_object_id(),
+                                                image: pending.image.clone(),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+
                                 // Every Standard-14 base-font name that the overlay content
                                 // stream will actually emit via `Tf` needs a matching Font
                                 // object registered in this page's `/Resources/Font`, else the
@@ -2541,17 +2611,22 @@ impl DocumentEditor {
                                     if let Some(contents) = new_dict.get("Contents").cloned() {
                                         let additions_ref =
                                             Object::Reference(ObjectRef::new(additions_id, 0));
-                                        let contents_array = match contents {
-                                            Object::Reference(_) => {
-                                                Object::Array(vec![contents, additions_ref])
-                                            },
-                                            Object::Array(mut arr) => {
-                                                arr.push(additions_ref);
-                                                Object::Array(arr)
-                                            },
-                                            _ => Object::Array(vec![contents, additions_ref]),
+                                        let save_ref = overlay_save_id
+                                            .map(|id| Object::Reference(ObjectRef::new(id, 0)));
+                                        let mut contents_array = match contents {
+                                            Object::Array(arr) => arr,
+                                            single => vec![single],
                                         };
-                                        new_dict.insert("Contents".to_string(), contents_array);
+                                        // `q` first, so the `Q` that opens the overlay
+                                        // stream drops the original's leftover CTM.
+                                        if let Some(save_ref) = save_ref {
+                                            contents_array.insert(0, save_ref);
+                                        }
+                                        contents_array.push(additions_ref);
+                                        new_dict.insert(
+                                            "Contents".to_string(),
+                                            Object::Array(contents_array),
+                                        );
                                     }
                                     final_page_obj = Object::Dictionary(new_dict);
                                 }
@@ -2565,7 +2640,7 @@ impl DocumentEditor {
                                 // must be resolved via `self.source.load_object()` or the
                                 // existing Font entries (e.g. /F1, /F3 used by the page's
                                 // original content) are lost when /Resources is rebuilt below.
-                                if !overlay_font_ids.is_empty() {
+                                if !overlay_font_ids.is_empty() || !overlay_xobject_ids.is_empty() {
                                     if let Some(page_dict) = final_page_obj.as_dict() {
                                         let mut new_dict = page_dict.clone();
 
@@ -2666,6 +2741,29 @@ impl DocumentEditor {
                                             "Font".to_string(),
                                             Object::Dictionary(font_dict),
                                         );
+
+                                        // Same treatment for the images the overlay
+                                        // draws: without this the stream's `Do` names
+                                        // an XObject the page never declares, and
+                                        // readers report it as unknown.
+                                        if !overlay_xobject_ids.is_empty() {
+                                            let mut xobject_dict: HashMap<String, Object> =
+                                                match resources_dict.get("XObject") {
+                                                    Some(obj) => resolve_dict(obj, &self.source),
+                                                    None => HashMap::new(),
+                                                };
+                                            for image in &overlay_xobject_ids {
+                                                xobject_dict.insert(
+                                                    image.resource_id.clone(),
+                                                    Object::Reference(ObjectRef::new(image.id, 0)),
+                                                );
+                                            }
+                                            resources_dict.insert(
+                                                "XObject".to_string(),
+                                                Object::Dictionary(xobject_dict),
+                                            );
+                                        }
+
                                         new_dict.insert(
                                             "Resources".to_string(),
                                             Object::Dictionary(resources_dict),
@@ -2814,10 +2912,22 @@ impl DocumentEditor {
                                     // We know the addition's object id directly, so there's no
                                     // need to infer it positionally from the array.
                                     let contents_value = match overlay_additions_id {
-                                        Some(additions_id) => Object::Array(vec![
-                                            redacted_ref,
-                                            Object::Reference(ObjectRef::new(additions_id, 0)),
-                                        ]),
+                                        // Bracketed the same way as the non-redacted
+                                        // path above, so the overlay starts in page
+                                        // space rather than in the redacted stream's.
+                                        Some(additions_id) => Object::Array(
+                                            overlay_save_id
+                                                .map(|id| Object::Reference(ObjectRef::new(id, 0)))
+                                                .into_iter()
+                                                .chain([
+                                                    redacted_ref,
+                                                    Object::Reference(ObjectRef::new(
+                                                        additions_id,
+                                                        0,
+                                                    )),
+                                                ])
+                                                .collect(),
+                                        ),
                                         None => redacted_ref,
                                     };
                                     new_dict.insert("Contents".to_string(), contents_value);
@@ -3514,37 +3624,96 @@ impl DocumentEditor {
                                     }
                                 }
 
+                                // Write the `q` that brackets the original content, so
+                                // the `Q` opening the overlay below restores page space.
+                                if let Some(save_id) = overlay_save_id {
+                                    let save_stream = Object::Stream {
+                                        dict: HashMap::new(),
+                                        data: b"q\n".to_vec().into(),
+                                    };
+                                    let offset = writer.stream_position()?;
+                                    let bytes = serialize_obj(
+                                        &serializer,
+                                        save_id,
+                                        0,
+                                        &save_stream,
+                                        &encryption_handler,
+                                    );
+                                    writer.write_all(&bytes)?;
+                                    xref_entries.push((save_id, offset, 0, true));
+                                }
+
                                 // Write overlay additions stream (add_text on existing page)
-                                if let Some(additions_id) = overlay_additions_id {
-                                    if let Some(added) =
-                                        self.overlay_additions.get(&source_page_index)
-                                    {
-                                        let wrapper = StructureElement {
-                                            structure_type: "Document".to_string(),
-                                            bbox: crate::geometry::Rect::new(0.0, 0.0, 0.0, 0.0),
-                                            children: added.clone(),
-                                            reading_order: None,
-                                            alt_text: None,
-                                            language: None,
-                                        };
-                                        if let Ok((content_bytes, _pending)) =
-                                            self.generate_content_stream(&wrapper)
-                                        {
-                                            let additions_stream = Object::Stream {
-                                                dict: HashMap::new(),
-                                                data: content_bytes.into(),
-                                            };
-                                            let offset = writer.stream_position()?;
-                                            let bytes = serialize_obj(
-                                                &serializer,
-                                                additions_id,
+                                if let (Some(additions_id), Some((content_bytes, _))) =
+                                    (overlay_additions_id, overlay_content.as_ref())
+                                {
+                                    let mut data = b"Q\n".to_vec();
+                                    data.extend_from_slice(content_bytes);
+                                    let additions_stream = Object::Stream {
+                                        dict: HashMap::new(),
+                                        data: data.into(),
+                                    };
+                                    let offset = writer.stream_position()?;
+                                    let bytes = serialize_obj(
+                                        &serializer,
+                                        additions_id,
+                                        0,
+                                        &additions_stream,
+                                        &encryption_handler,
+                                    );
+                                    writer.write_all(&bytes)?;
+                                    xref_entries.push((additions_id, offset, 0, true));
+                                }
+
+                                // Write an XObject for each image the overlay draws,
+                                // routed through the same conversion the full-rewrite
+                                // path uses so that PNG bytes are decoded rather than
+                                // mislabelled as FlateDecode, and so an alpha channel
+                                // becomes a real /SMask.
+                                for image in &overlay_xobject_ids {
+                                    let (data, soft_mask) =
+                                        image_content_to_xobject_stream(&image.image);
+                                    let mut dict = data.build_xobject_dict();
+                                    if soft_mask.is_some() {
+                                        dict.insert(
+                                            "SMask".to_string(),
+                                            Object::Reference(ObjectRef::new(
+                                                image.soft_mask_id,
                                                 0,
-                                                &additions_stream,
-                                                &encryption_handler,
-                                            );
-                                            writer.write_all(&bytes)?;
-                                            xref_entries.push((additions_id, offset, 0, true));
-                                        }
+                                            )),
+                                        );
+                                    }
+
+                                    let offset = writer.stream_position()?;
+                                    let bytes = serialize_obj(
+                                        &serializer,
+                                        image.id,
+                                        0,
+                                        &Object::Stream {
+                                            dict,
+                                            data: data.data.clone().into(),
+                                        },
+                                        &encryption_handler,
+                                    );
+                                    writer.write_all(&bytes)?;
+                                    xref_entries.push((image.id, offset, 0, true));
+
+                                    if let (Some(mask), Some(mask_dict)) =
+                                        (soft_mask, data.build_soft_mask_dict())
+                                    {
+                                        let offset = writer.stream_position()?;
+                                        let bytes = serialize_obj(
+                                            &serializer,
+                                            image.soft_mask_id,
+                                            0,
+                                            &Object::Stream {
+                                                dict: mask_dict,
+                                                data: mask.into(),
+                                            },
+                                            &encryption_handler,
+                                        );
+                                        writer.write_all(&bytes)?;
+                                        xref_entries.push((image.soft_mask_id, offset, 0, true));
                                     }
                                 }
 
