@@ -930,8 +930,16 @@ impl ContentStreamBuilder {
         let font_name = self.map_font_name(&text.font.name, text.style.weight.is_bold());
         self.set_font(&font_name, text.font.size);
 
-        // Position and show text
-        self.op(ContentStreamOp::SetTextMatrix(1.0, 0.0, 0.0, 1.0, text.bbox.x, text.bbox.y));
+        // Position and show text. `TextContent` carries a full text matrix for
+        // rotated and sheared text, which this path used to drop on the floor,
+        // so anything but upright text came out upright and in the wrong place.
+        // `ImageContent::matrix` is already honoured by `add_image_content`.
+        let matrix = text
+            .matrix
+            .unwrap_or([1.0, 0.0, 0.0, 1.0, text.bbox.x, text.bbox.y]);
+        self.op(ContentStreamOp::SetTextMatrix(
+            matrix[0], matrix[1], matrix[2], matrix[3], matrix[4], matrix[5],
+        ));
         self.op(ContentStreamOp::ShowText(text.text.clone()));
 
         if is_artifact {
