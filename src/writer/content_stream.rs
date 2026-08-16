@@ -1396,6 +1396,12 @@ impl ContentStreamBuilder {
             }
         }
 
+        // Close any text object a child left open before EMC, since EMC must
+        // sit outside BT/ET just as BDC does (ISO 32000-1 s14.6). Without this
+        // a text child serializes as `BT ... Tj EMC`, which strict readers
+        // reject and lenient ones recover from inconsistently.
+        self.end_text();
+
         // End marked content
         self.op(ContentStreamOp::EndMarkedContent);
 

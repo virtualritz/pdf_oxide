@@ -148,6 +148,7 @@ pub use pattern::{
     PatternPaintType, PatternPresets, PatternTilingType, ShadingPatternBuilder,
     TilingPatternBuilder,
 };
+pub(crate) use pdf_writer::image_content_to_xobject_stream;
 pub use pdf_writer::{PageBuilder, PdfWriter, PdfWriterConfig};
 pub use richmedia::{
     RichMediaActivation, RichMediaAnnotation, RichMediaAsset, RichMediaContent,
