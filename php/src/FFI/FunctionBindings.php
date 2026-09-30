@@ -686,6 +686,34 @@ class FunctionBindings
     }
 
     /**
+     * Get the encoded image bytes (PNG or JPEG, per the format the image
+     * was rendered with) from a rendered-image handle.
+     *
+     * @param CData $imageHandle The image handle (from pdfRenderPage*)
+     * @return string Encoded image binary data
+     */
+    public function pdfGetRenderedImageData(CData $imageHandle): string
+    {
+        // C: uint8_t *pdf_get_rendered_image_data(const FfiRenderedImage *img,
+        //        int32_t *data_len, int32_t *error_code)
+        $dataLen = $this->ffi->new('int32_t');
+        $errorCode = $this->ffi->new('int32_t');
+        $dataPtr = $this->ffi->pdf_get_rendered_image_data(
+            $imageHandle,
+            FFI::addr($dataLen),
+            FFI::addr($errorCode)
+        );
+        ErrorHandler::check((int) $errorCode->cdata, 'pdf_get_rendered_image_data');
+        if ($dataPtr === null) {
+            return '';
+        }
+        $bytes = FFI::string($dataPtr, (int) $dataLen->cdata);
+        // Caller-owned buffer — must free.
+        $this->ffi->free_bytes($this->ffi->cast('uint8_t*', $dataPtr));
+        return $bytes;
+    }
+
+    /**
      * Estimate rendering time for a page.
      *
      * @param CData $handle The document handle
@@ -1777,6 +1805,33 @@ class FunctionBindings
         $errorCode = $this->ffi->new('int');
         $json = $this->ffi->pdf_document_classify_document($handle, FFI::addr($errorCode));
         ErrorHandler::check($errorCode->cdata, 'pdf_document_classify_document');
+        return StringMarshaller::fromCString($json);
+    }
+
+    /**
+     * The document's structured diagnostics as a raw JSON array
+     * (`"[]"` when there are none). Non-destructive: a later call returns
+     * the same entries plus any raised since. Each entry's `category` is an
+     * open-ended snake_case token — tolerate tokens you do not know.
+     */
+    public function pdfDocumentStructuredWarnings(CData $handle): string
+    {
+        $errorCode = $this->ffi->new('int');
+        $json = $this->ffi->pdf_document_structured_warnings($handle, FFI::addr($errorCode));
+        ErrorHandler::check($errorCode->cdata, 'pdf_document_structured_warnings');
+        return StringMarshaller::fromCString($json);
+    }
+
+    /**
+     * As `pdfDocumentStructuredWarnings`, but drains: the returned entries
+     * are removed, so a batch pipeline can read per document without the
+     * sink growing across the run.
+     */
+    public function pdfDocumentTakeStructuredWarnings(CData $handle): string
+    {
+        $errorCode = $this->ffi->new('int');
+        $json = $this->ffi->pdf_document_take_structured_warnings($handle, FFI::addr($errorCode));
+        ErrorHandler::check($errorCode->cdata, 'pdf_document_take_structured_warnings');
         return StringMarshaller::fromCString($json);
     }
 

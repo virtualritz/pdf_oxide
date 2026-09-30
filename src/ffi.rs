@@ -1803,7 +1803,9 @@ pub extern "C" fn document_editor_erase_regions(
     let editor = handle_mut(handle);
     let flat = raw_slice(rects, rects_count * 4);
     let boxes: Vec<[f32; 4]> = flat
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32, c[3] as f32])
         .collect();
     match editor.erase_regions(page, &boxes) {
@@ -3240,6 +3242,36 @@ pub extern "C" fn pdf_oxide_element_get_rect(
     write_out(y, span.bbox.y);
     write_out(width, span.bbox.width);
     write_out(height, span.bbox.height);
+    set_error(error_code, ERR_SUCCESS);
+}
+
+/// Page-space extents of the span: the rect from `pdf_oxide_element_get_rect`
+/// with any text-matrix rotation resolved into an axis-aligned page-space
+/// hull. Identical to `pdf_oxide_element_get_rect` for upright runs.
+#[no_mangle]
+pub extern "C" fn pdf_oxide_element_get_page_rect(
+    elements: *const FfiElementList,
+    index: i32,
+    x: *mut f32,
+    y: *mut f32,
+    width: *mut f32,
+    height: *mut f32,
+    error_code: *mut i32,
+) {
+    if elements.is_null() || x.is_null() || y.is_null() || width.is_null() || height.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return;
+    }
+    let list = handle_ref(elements);
+    if index < 0 || (index as usize) >= list.spans.len() {
+        set_error(error_code, ERR_INVALID_PAGE);
+        return;
+    }
+    let b = list.spans[index as usize].page_bbox();
+    write_out(x, b.x);
+    write_out(y, b.y);
+    write_out(width, b.width);
+    write_out(height, b.height);
     set_error(error_code, ERR_SUCCESS);
 }
 
@@ -4700,7 +4732,7 @@ pub extern "C" fn pdf_certificate_free(handle: *mut std::ffi::c_void) {
 #[cfg(feature = "rendering")]
 use crate::rendering::{
     self, ImageFormat as RenderImageFormat, RenderOptions as RustRenderOptions,
-    RenderedImage as RustRenderedImage,
+    RenderedImage as RustRenderedImage, DEFAULT_MAX_OUTPUT_PIXELS as RENDER_MAX_OUTPUT_PIXELS,
 };
 
 #[cfg(feature = "rendering")]
@@ -4827,6 +4859,7 @@ pub extern "C" fn pdf_render_page_with_options(
         // OCG layer filtering is exposed on the variant
         // `pdf_render_page_with_options_ex` below — keeping this ABI stable.
         let opts = RustRenderOptions {
+            max_output_pixels: RENDER_MAX_OUTPUT_PIXELS,
             dpi: dpi as u32,
             format: fmt,
             background,
@@ -4931,6 +4964,7 @@ pub extern "C" fn pdf_render_page_with_options_ex(
         }
 
         let opts = RustRenderOptions {
+            max_output_pixels: RENDER_MAX_OUTPUT_PIXELS,
             dpi: dpi as u32,
             format: fmt,
             background,
@@ -8313,6 +8347,80 @@ pub extern "C" fn pdf_document_classify_page(
     }
 }
 
+/// The document's structured diagnostics as a malloc'd JSON array; free via
+/// the string-free. `"[]"` when there are none.
+///
+/// Non-destructive: a later call returns the same entries plus any raised
+/// since. Use `pdf_document_take_structured_warnings` to drain.
+///
+/// ```json
+/// [{"category":"no_text_layer","page":0,
+///   "message":"page 1 has no extractable text layer…","spec_section":null}]
+/// ```
+///
+/// `category` is a stable snake_case token. **Consumers must tolerate tokens
+/// they do not know** — categories are added in minor releases, so a binding
+/// that models this as a closed enum turns a routine release into a
+/// deserialisation failure for its users. Keep it a string, or give the enum
+/// an unknown-value arm.
+///
+/// This is the channel the library reports *about* extraction on. Nothing is
+/// written into the extracted content itself: a page with no text extracts as
+/// nothing and says so here, carrying the page index, so a caller can decide
+/// whether to surface it, where, and in what language.
+#[no_mangle]
+pub extern "C" fn pdf_document_structured_warnings(
+    handle: *mut PdfDocument,
+    error_code: *mut i32,
+) -> *mut c_char {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return ptr::null_mut();
+    }
+    let doc = handle_ref(handle);
+    match serde_json::to_string(&doc.structured_warnings()) {
+        Ok(j) => {
+            set_error(error_code, ERR_SUCCESS);
+            to_c_string(&j)
+        },
+        Err(e) => {
+            set_error(
+                error_code,
+                classify_error(&crate::error::Error::InvalidOperation(e.to_string())),
+            );
+            ptr::null_mut()
+        },
+    }
+}
+
+/// As `pdf_document_structured_warnings`, but drains: the returned entries are
+/// removed, so a batch pipeline can read per document without the sink growing
+/// across the run.
+#[no_mangle]
+pub extern "C" fn pdf_document_take_structured_warnings(
+    handle: *mut PdfDocument,
+    error_code: *mut i32,
+) -> *mut c_char {
+    if handle.is_null() {
+        set_error(error_code, ERR_INVALID_ARG);
+        return ptr::null_mut();
+    }
+    let doc = handle_ref(handle);
+    match serde_json::to_string(&doc.take_structured_warnings()) {
+        Ok(j) => {
+            set_error(error_code, ERR_SUCCESS);
+            to_c_string(&j)
+        },
+        Err(e) => {
+            set_error(
+                error_code,
+                classify_error(&crate::error::Error::InvalidOperation(e.to_string())),
+            );
+            ptr::null_mut()
+        },
+    }
+}
+
 /// Cheap whole-document classification (per-page kinds +
 /// `pages_needing_ocr` + aggregate summary). Malloc'd JSON
 /// `DocumentClassification`; free via the string-free.
@@ -8835,6 +8943,17 @@ struct JsonElement<'a> {
     y: f32,
     width: f32,
     height: f32,
+    /// Page-space extents: the x/y/width/height rect with any text-matrix
+    /// rotation resolved into an axis-aligned page-space hull. Identical to
+    /// it for upright runs.
+    #[serde(rename = "pageX")]
+    page_x: f32,
+    #[serde(rename = "pageY")]
+    page_y: f32,
+    #[serde(rename = "pageWidth")]
+    page_width: f32,
+    #[serde(rename = "pageHeight")]
+    page_height: f32,
     /// §9.10.2 mapping-provenance label; omitted when the font is unresolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<&'static str>,
@@ -9013,14 +9132,21 @@ pub extern "C" fn pdf_oxide_elements_to_json(
     let items: Vec<JsonElement> = list
         .spans
         .iter()
-        .map(|s| JsonElement {
-            r#type: "text",
-            text: &s.text,
-            x: s.bbox.x,
-            y: s.bbox.y,
-            width: s.bbox.width,
-            height: s.bbox.height,
-            provenance: s.provenance.map(|p| p.as_str()),
+        .map(|s| {
+            let pb = s.page_bbox();
+            JsonElement {
+                r#type: "text",
+                text: &s.text,
+                x: s.bbox.x,
+                y: s.bbox.y,
+                width: s.bbox.width,
+                height: s.bbox.height,
+                page_x: pb.x,
+                page_y: pb.y,
+                page_width: pb.width,
+                page_height: pb.height,
+                provenance: s.provenance.map(|p| p.as_str()),
+            }
         })
         .collect();
     match serde_json::to_string(&items) {

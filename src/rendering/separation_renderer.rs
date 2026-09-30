@@ -128,7 +128,7 @@
     clippy::only_used_in_recursion
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tiny_skia::{FillRule, Mask, PathBuilder, Pixmap, Transform};
@@ -147,6 +147,7 @@ use super::resolution::{
     ResolutionPipeline, SeparationBackend, SeparationSurface,
 };
 use super::text_rasterizer::TextRasterizer;
+use super::{device_bounds_rasterizable, guarded_fill_path, guarded_stroke_path};
 use crate::rendering::resolution::{DeviceColor, LogicalColor};
 use smallvec::SmallVec;
 
@@ -303,10 +304,18 @@ fn render_plates_for_inks(
         let content_data = doc.get_page_content_data(page_num)?;
         let operators = parse_content_stream(&content_data)?;
 
+        // Same baseline the composite renderer uses (§8.11.4): the document's
+        // own /OCProperties /D BaseState//ON//OFF configuration. Computed here
+        // rather than passed in, because the separation entry points take no
+        // render options — and the defect this closes is a layer the *document*
+        // hides being counted as ink.
+        let excluded_layers = crate::optional_content::compute_default_off_ocgs(doc);
+
         let mut ctx = SeparationContext {
             doc,
             text_rasterizer: &text_rasterizer,
             fonts: &fonts,
+            excluded_layers: &excluded_layers,
         };
 
         execute_separation_operators(
@@ -666,35 +675,19 @@ fn compute_page_extent(
     dpi: u32,
 ) -> Result<(u32, u32, Transform)> {
     let page_info = doc.get_page_info(page_num)?;
-    let media_box = page_info.media_box;
+    // Same page rectangle the composite renderer uses — §14.11.2 crop box
+    // intersected with the media box — so plates and composite stay the same
+    // size and origin.
+    let media_box = super::page_render_box(&page_info.media_box, page_info.crop_box.as_ref());
 
-    // `%` is a remainder and preserves sign, so a legal negative /Rotate (e.g. -90,
-    // equivalent to 270 per ISO 32000-1 s7.7.3.3 Table 30) matched neither 90 nor
-    // 270 below and the page rendered unrotated. rem_euclid normalizes to 0..359,
-    // matching get_page_rotation's own `((raw % 360) + 360) % 360` convention.
-    let rotation = page_info.rotation.rem_euclid(360);
-    let (page_w, page_h) = if rotation == 90 || rotation == 270 {
-        (media_box.height, media_box.width)
-    } else {
-        (media_box.width, media_box.height)
-    };
+    // Shared with the composite renderer, so the two cannot disagree about
+    // which way a rotated page faces — see `page_base_transform`.
+    let rotation = page_info.rotation;
+    let (page_w, page_h) = super::rotated_page_extent(&media_box, rotation);
     let scale = dpi as f32 / 72.0;
     let width = (page_w * scale).ceil() as u32;
     let height = (page_h * scale).ceil() as u32;
-
-    let base_transform = match rotation {
-        90 => Transform::from_translate(-media_box.x, -media_box.y)
-            .post_concat(Transform::from_row(0.0, scale, scale, 0.0, 0.0, 0.0)),
-        180 => Transform::from_translate(-media_box.x, -media_box.y)
-            .post_scale(-scale, scale)
-            .post_translate(media_box.width * scale, 0.0),
-        270 => Transform::from_translate(-media_box.x, -media_box.y).post_concat(
-            Transform::from_row(0.0, scale, -scale, 0.0, media_box.height * scale, 0.0),
-        ),
-        _ => Transform::from_translate(-media_box.x, -media_box.y)
-            .post_scale(scale, -scale)
-            .post_translate(0.0, page_h * scale),
-    };
+    let base_transform = super::page_base_transform(&media_box, rotation, scale);
 
     Ok((width, height, base_transform))
 }
@@ -1268,6 +1261,11 @@ struct SeparationContext<'a> {
     doc: &'a PdfDocument,
     text_rasterizer: &'a TextRasterizer,
     fonts: &'a HashMap<String, Arc<FontInfo>>,
+    /// OCGs hidden by the document's own `/OCProperties /D` configuration
+    /// (ISO 32000-1:2008 §8.11.4), computed exactly as the composite renderer
+    /// computes its baseline. Without this the plates counted ink for layers
+    /// the page render omits, so the two disagreed about the same page.
+    excluded_layers: &'a HashSet<String>,
 }
 
 /// Color state tracked alongside the graphics state for separation rendering.
@@ -1421,8 +1419,86 @@ fn execute_separation_operators(
     let mut backend = SeparationBackend::new();
     let target_inks_owned: Vec<InkName> = target_inks.iter().map(|s| InkName::new(*s)).collect();
 
+    // Optional-content exclusion, mirroring the composite renderer.
+    //
+    // The separation renderer had no marked-content arms at all, so the /OC
+    // hidden-layer exclusion the composite render applies never reached the ink
+    // plates: a layer excluded from the page was still counted in the
+    // separations, and two renderers of one page gave contradictory answers.
+    //
+    // `excluded_layer_depth` counts nested BDC/OC scopes that resolve to an
+    // excluded layer; `marked_content_is_excluded` lets EMC decrement only the
+    // entries that incremented.
+    let mut excluded_layer_depth: u32 = 0;
+    let mut marked_content_is_excluded: Vec<bool> = Vec::new();
+    let excluded_layers: &HashSet<String> = ctx.excluded_layers;
+
     for op in operators {
+        // ISO 32000-1:2008 §8.11.3: when optional content is hidden "the
+        // content shall not be drawn" while "graphics state operations ...
+        // shall still be applied". So suppression replaces each painting
+        // operator with the path-clearing `n` rather than skipping the
+        // operator loop — the path bookkeeping and every state change still
+        // happen, exactly as they would if the content were visible.
+        let op = if excluded_layer_depth > 0 {
+            match op {
+                Operator::Fill
+                | Operator::FillEvenOdd
+                | Operator::Stroke
+                | Operator::FillStroke
+                | Operator::CloseFillStroke
+                | Operator::FillStrokeEvenOdd
+                | Operator::CloseFillStrokeEvenOdd => &Operator::EndPath,
+                other => other,
+            }
+        } else {
+            op
+        };
+
+        // Drawing an XObject or showing text inside a hidden scope marks the
+        // page just as a fill would, and neither has a path-clearing
+        // equivalent, so those are skipped outright.
+        if excluded_layer_depth > 0
+            && matches!(
+                op,
+                Operator::Do { .. }
+                    | Operator::Tj { .. }
+                    | Operator::TJ { .. }
+                    | Operator::Quote { .. }
+                    | Operator::DoubleQuote { .. }
+                    | Operator::PaintShading { .. }
+                    | Operator::InlineImage { .. }
+            )
+        {
+            continue;
+        }
+
         match op {
+            Operator::BeginMarkedContent { .. } => {
+                marked_content_is_excluded.push(false);
+            },
+            Operator::BeginMarkedContentDict { tag, properties } => {
+                let mut is_excluded = false;
+                if tag == "OC" {
+                    is_excluded = crate::optional_content::resolve_and_check_ocg_excluded(
+                        properties,
+                        Some(resources),
+                        Some(ctx.doc),
+                        excluded_layers,
+                    );
+                }
+                if is_excluded {
+                    excluded_layer_depth += 1;
+                }
+                marked_content_is_excluded.push(is_excluded);
+            },
+            Operator::EndMarkedContent => {
+                if let Some(was_excluded) = marked_content_is_excluded.pop() {
+                    if was_excluded && excluded_layer_depth > 0 {
+                        excluded_layer_depth -= 1;
+                    }
+                }
+            },
             Operator::SaveState => {
                 gs_stack.save();
                 let cs = color_state_stack
@@ -1632,7 +1708,11 @@ fn execute_separation_operators(
                 current_path.close();
             },
 
-            Operator::Stroke => {
+            Operator::Stroke | Operator::CloseAndStroke => {
+                // `s` closes the subpath first (Table 60).
+                if matches!(op, Operator::CloseAndStroke) {
+                    current_path.close();
+                }
                 apply_separation_clip(
                     &mut pending_clip,
                     &mut clip_stack,
@@ -2511,7 +2591,7 @@ pub(crate) fn fill_separation(
     // overlapping pixels, which SourceOver gives us for free.
     paint.blend_mode = tiny_skia::BlendMode::SourceOver;
 
-    pixmap.fill_path(path, &paint, fill_rule, transform, clip);
+    guarded_fill_path(pixmap, path, &paint, fill_rule, transform, clip);
 }
 
 /// Stroke a path into the separation pixmap with the given tint value.
@@ -2547,7 +2627,7 @@ fn stroke_separation(
         stroke.dash = tiny_skia::StrokeDash::new(gs.dash_pattern.0.clone(), gs.dash_pattern.1);
     }
 
-    pixmap.stroke_path(path, &paint, &stroke, transform, clip);
+    guarded_stroke_path(pixmap, path, &paint, &stroke, transform, clip);
 }
 
 /// Apply a pending clip path to the clip stack.
@@ -2571,6 +2651,13 @@ fn apply_separation_clip(
         }
         let gs = gs_stack.current();
         let transform = combine_transforms(base_transform, &gs.ctm);
+
+        // See `apply_pending_clip` in page_renderer: a clip path beyond f32
+        // device precision is dropped, not materialized as an empty mask.
+        if !device_bounds_rasterizable(&path, transform) {
+            log::debug!("skipping clip beyond f32 device precision: {:?}", path.bounds());
+            return;
+        }
 
         if let Some(path_transformed) = path.transform(transform) {
             let mut new_mask = Mask::new(pixmap_width, pixmap_height).unwrap();
@@ -2896,49 +2983,66 @@ fn paint_image_to_plates(
     // extractor exposes RGB after Indexed expansion; for separation
     // routing we only consume CMYK / Separation / DeviceN paths (the
     // shapes above), so anything else falls through to skip.
-    let (samples, stride) = match (resolved_space.clone(), extractor_cs, pdf_image.data()) {
-        // Raw CMYK pixel buffer (Flate / CCITT / etc. on a DeviceCMYK image).
-        (
-            ResolvedSpace::Cmyk | ResolvedSpace::IccCmyk,
-            PdfCs::DeviceCMYK | PdfCs::ICCBased(4),
-            ImageData::Raw {
-                pixels,
-                format: PixelFormat::CMYK,
+    // `decode_pre_applied`: whether /Decode is ALREADY mapped into these
+    // samples (ISO 32000-1 §8.9.5.2), in which case re-applying it here would
+    // double-invert. For extractor-provided Raw buffers this is exactly what
+    // the extractor recorded — notably it is false when the extractor could
+    // not interpret the array (e.g. a DeviceN whose ink count differs from
+    // the colour space's declared component count), so this path still owes
+    // the image its /Decode. JPEG samples are decoded locally and always do.
+    // Deliberately not `!samples_are_raw()`: that is the wider "were these
+    // samples rescaled at all" fact, true for every sub-byte and 16-bit
+    // image, and reading it here drops the /Decode those images are owed.
+    let extractor_decode_applied = pdf_image.decode_folded_in();
+    let (samples, stride, decode_pre_applied) =
+        match (resolved_space.clone(), extractor_cs, pdf_image.data()) {
+            // Raw CMYK pixel buffer (Flate / CCITT / etc. on a DeviceCMYK image).
+            (
+                ResolvedSpace::Cmyk | ResolvedSpace::IccCmyk,
+                PdfCs::DeviceCMYK | PdfCs::ICCBased(4),
+                ImageData::Raw {
+                    pixels,
+                    format: PixelFormat::CMYK,
+                },
+            ) => (pixels.clone(), 4usize, extractor_decode_applied),
+            // JPEG-encoded DeviceCMYK image — decode to raw CMYK preserving APP14 inversion.
+            (
+                ResolvedSpace::Cmyk | ResolvedSpace::IccCmyk,
+                PdfCs::DeviceCMYK | PdfCs::ICCBased(4),
+                ImageData::Jpeg(bytes),
+            ) => (crate::extractors::images::decode_cmyk_jpeg_to_raw_cmyk(bytes)?, 4, false),
+            // Separation: 1 channel.
+            (ResolvedSpace::Separation(_), PdfCs::Separation, ImageData::Raw { pixels, .. }) => {
+                (pixels.clone(), 1, extractor_decode_applied)
             },
-        ) => (pixels.clone(), 4usize),
-        // JPEG-encoded DeviceCMYK image — decode to raw CMYK preserving APP14 inversion.
-        (
-            ResolvedSpace::Cmyk | ResolvedSpace::IccCmyk,
-            PdfCs::DeviceCMYK | PdfCs::ICCBased(4),
-            ImageData::Jpeg(bytes),
-        ) => (crate::extractors::images::decode_cmyk_jpeg_to_raw_cmyk(bytes)?, 4),
-        // Separation: 1 channel.
-        (ResolvedSpace::Separation(_), PdfCs::Separation, ImageData::Raw { pixels, .. }) => {
-            (pixels.clone(), 1)
-        },
-        // DeviceN: N channels (extractor reports DeviceN with N components).
-        (ResolvedSpace::DeviceN(ref names), PdfCs::DeviceN, ImageData::Raw { pixels, .. }) => {
-            (pixels.clone(), names.len().max(1))
-        },
-        // Shape mismatch (e.g. extractor reports a different colour space than
-        // the dict declared after our resolver ran). Drop silently — the
-        // resolver result wins for routing semantics but we won't fabricate
-        // channels we don't have.
-        _ => {
-            log::debug!(
-                "Image XObject '{name}': shape mismatch between resolved colour space \
+            // DeviceN: N channels (extractor reports DeviceN with N components).
+            (ResolvedSpace::DeviceN(ref names), PdfCs::DeviceN, ImageData::Raw { pixels, .. }) => {
+                (pixels.clone(), names.len().max(1), extractor_decode_applied)
+            },
+            // Shape mismatch (e.g. extractor reports a different colour space than
+            // the dict declared after our resolver ran). Drop silently — the
+            // resolver result wins for routing semantics but we won't fabricate
+            // channels we don't have.
+            _ => {
+                log::debug!(
+                    "Image XObject '{name}': shape mismatch between resolved colour space \
                  and extractor sample format; skipping"
-            );
-            return Ok(());
-        },
-    };
+                );
+                return Ok(());
+            },
+        };
     let _ = color_state; // currently unused outside the image-mask path
 
     // §8.9.5.2: /Decode maps raw sample values into the colour space's range.
     // For per-plate routing the colour space is treated as identity, so the
     // only effect that matters is inversion (`/Decode [1 0]` on a Separation
-    // image, etc.). Default identity is `[0 1]` per channel.
-    let decode = read_decode_array(dict, stride);
+    // image, etc.). Default identity is `[0 1]` per channel. Only consulted
+    // for sample sources the extractor has not already mapped.
+    let decode = if decode_pre_applied {
+        None
+    } else {
+        read_decode_array(dict, stride)
+    };
 
     let gs = gs_stack.current();
     let transform = combine_transforms(base_transform, &gs.ctm);
@@ -3057,12 +3161,15 @@ fn paint_image_mask_to_plates(
         Object::Stream { dict, .. } => dict,
         _ => return Ok(()),
     };
-    let w = dict.get("Width").and_then(|o| o.as_integer()).unwrap_or(0) as usize;
-    let h = dict.get("Height").and_then(|o| o.as_integer()).unwrap_or(0) as usize;
-    let pixel_count = w * h;
-    if pixel_count == 0 {
+    // Same geometry contract as the stencil path in `page_renderer`, which
+    // already rejects non-positive and unbacked dimensions before allocating.
+    let layout = crate::rendering::page_renderer::PageRenderer::image_mask_layout(dict);
+    let Ok((w32, h32, _row_bytes, packed_len, _rgba_len)) = layout else {
+        log::warn!("Skipping image mask '{name}': {}", layout.unwrap_err());
         return Ok(());
-    }
+    };
+    let (w, h) = (w32 as usize, h32 as usize);
+    let pixel_count = w * h;
     let bpc = dict
         .get("BitsPerComponent")
         .and_then(|o| o.as_integer())
@@ -3080,10 +3187,18 @@ fn paint_image_mask_to_plates(
     } else {
         xobject.decode_stream_data()?
     };
-    let mut stencil = expand_1bpc_to_8bpc(&packed, w as u32, h as u32);
-    if stencil.len() < pixel_count {
+    // Checked before expanding, because `expand_1bpc_to_8bpc` zero-pads and
+    // would size the buffer from the declaration: `/Width 2147483648 /Height
+    // 2147483648` is representable and asks for 2^62 bytes.
+    if packed.len() < packed_len {
+        log::warn!(
+            "Skipping image mask '{name}': {w}x{h} needs {packed_len} bytes, the stream \
+             carries {}",
+            packed.len()
+        );
         return Ok(());
     }
+    let mut stencil = expand_1bpc_to_8bpc(&packed, w32, h32);
 
     // §8.9.6.2: decoded sample value 0 marks the pixel with the current
     // colour; value 1 leaves it transparent. /Decode defaults to [0 1] —

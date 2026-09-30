@@ -2911,13 +2911,18 @@ SEXP r_page_get_elements(SEXP ext, SEXP page) {
         code = 0;
         pdf_oxide_element_get_rect(list, i, &x, &y, &w, &h, &code);
         if (code != 0) { free_string(type); free_string(txt); pdf_oxide_elements_free(list); pdfox_raise(code, "page_get_elements"); }
-        SEXP rec = PROTECT(Rf_allocVector(VECSXP, 3));
-        SEXP nms = PROTECT(Rf_allocVector(STRSXP, 3));
+        float px = 0, py = 0, pw = 0, ph = 0;
+        code = 0;
+        pdf_oxide_element_get_page_rect(list, i, &px, &py, &pw, &ph, &code);
+        if (code != 0) { free_string(type); free_string(txt); pdf_oxide_elements_free(list); pdfox_raise(code, "page_get_elements"); }
+        SEXP rec = PROTECT(Rf_allocVector(VECSXP, 4));
+        SEXP nms = PROTECT(Rf_allocVector(STRSXP, 4));
         SEXP tstr = PROTECT(Rf_mkChar(type)); free_string(type);
         SET_VECTOR_ELT(rec, 0, Rf_ScalarString(tstr));          SET_STRING_ELT(nms, 0, Rf_mkChar("type"));
         SEXP txstr = PROTECT(Rf_mkChar(txt)); free_string(txt);
         SET_VECTOR_ELT(rec, 1, Rf_ScalarString(txstr));         SET_STRING_ELT(nms, 1, Rf_mkChar("text"));
         SET_VECTOR_ELT(rec, 2, make_bbox(x, y, w, h));          SET_STRING_ELT(nms, 2, Rf_mkChar("rect"));
+        SET_VECTOR_ELT(rec, 3, make_bbox(px, py, pw, ph));      SET_STRING_ELT(nms, 3, Rf_mkChar("page_rect"));
         Rf_setAttrib(rec, R_NamesSymbol, nms);
         SET_VECTOR_ELT(out, i, rec);
         UNPROTECT(4);
@@ -3184,6 +3189,16 @@ SEXP r_doc_classify_document(SEXP ext) {
     int32_t code = 0;
     return take_string(pdf_document_classify_document(doc_ptr(ext), &code), code,
                        "classify_document");
+}
+SEXP r_doc_structured_warnings(SEXP ext) {
+    int32_t code = 0;
+    return take_string(pdf_document_structured_warnings(doc_ptr(ext), &code), code,
+                       "structured_warnings");
+}
+SEXP r_doc_take_structured_warnings(SEXP ext) {
+    int32_t code = 0;
+    return take_string(pdf_document_take_structured_warnings(doc_ptr(ext), &code), code,
+                       "take_structured_warnings");
 }
 
 /* ── HEADER / FOOTER / ARTIFACT (all int32 status) ── */
@@ -3897,6 +3912,8 @@ static const R_CallMethodDef CallEntries[] = {
     CDEF(r_doc_extract_page_auto, 3),
     CDEF(r_doc_classify_page, 2),
     CDEF(r_doc_classify_document, 1),
+    CDEF(r_doc_structured_warnings, 1),
+    CDEF(r_doc_take_structured_warnings, 1),
     CDEF(r_doc_remove_headers, 2),
     CDEF(r_doc_remove_footers, 2),
     CDEF(r_doc_remove_artifacts, 2),

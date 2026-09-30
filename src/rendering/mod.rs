@@ -47,7 +47,9 @@ pub(crate) mod separation_renderer;
 pub mod sidecar;
 mod text_rasterizer;
 
-pub use page_renderer::{ImageFormat, PageRenderer, RenderOptions, RenderedImage};
+pub use page_renderer::{
+    ImageFormat, PageRenderer, RenderOptions, RenderedImage, DEFAULT_MAX_OUTPUT_PIXELS,
+};
 pub use separation_renderer::{render_separation, render_separations, SeparationPlate};
 
 use crate::content::GraphicsState;
@@ -103,6 +105,316 @@ pub(crate) fn pdf_blend_mode_to_skia(mode: &str) -> tiny_skia::BlendMode {
         "Exclusion" => tiny_skia::BlendMode::Exclusion,
         _ => tiny_skia::BlendMode::SourceOver,
     }
+}
+
+/// Largest device-space coordinate a path may reach and still be handed to
+/// tiny_skia. 2^24 is where f32 stops representing adjacent integers, but it
+/// is not the operative bound: tiny_skia clips edges against the pixmap
+/// (`edge_clipper.rs`, engaged whenever a path is not contained in the clip)
+/// and keeps rasterizing well past that. The bound that matters is where the
+/// rasterizer actually gives up — beyond it the antialiased run accounting
+/// desynchronizes and panics (`alpha_runs.rs` `unwrap` on a run past the
+/// accumulated buffer).
+///
+/// Measured against tiny_skia 0.12 at 72 dpi: fills and cubics alike still
+/// rasterize correctly at 5e8 device units and produce nothing at 7e8, so
+/// the bound is the last value confirmed to work. Only 5e8..7e8 is
+/// unmeasured, and a draw landing in it is dropped although the rasterizer
+/// would have coped. The decade below was measured too, because a real
+/// document turned out to live there: a page in the corpus fills to 1.3e8
+/// device units, which an earlier 1e8 bound discarded.
+const MAX_DEVICE_COORD: f64 = 5.0e8;
+
+/// The rectangle a page is rendered to: its `/CropBox` clipped to the
+/// `/MediaBox`, or the media box when no crop box is given.
+///
+/// ISO 32000-1:2008 Table 30 on `/CropBox`: "A rectangle ... that shall define
+/// the visible region of default user space. When the page is displayed or
+/// printed, its contents **shall be clipped (cropped) to this rectangle** ...
+/// Default value: the value of MediaBox."
+///
+/// The crop box was parsed onto `PageInfo` and then never consulted by either
+/// renderer, so a cropped scan rendered at full media size showing the margins
+/// the file asked to have cropped away. §14.11.2 also has the crop box taken as
+/// its intersection with the media box, so a crop box larger than the medium
+/// does not enlarge the page.
+pub(crate) fn page_render_box(
+    media_box: &crate::geometry::Rect,
+    crop_box: Option<&crate::geometry::Rect>,
+) -> crate::geometry::Rect {
+    let Some(crop) = crop_box else {
+        return *media_box;
+    };
+    let x0 = crop.x.max(media_box.x);
+    let y0 = crop.y.max(media_box.y);
+    let x1 = (crop.x + crop.width).min(media_box.x + media_box.width);
+    let y1 = (crop.y + crop.height).min(media_box.y + media_box.height);
+    // A crop box that does not overlap the medium describes nothing to show;
+    // fall back to the media box rather than rendering an empty page.
+    if x1 <= x0 || y1 <= y0 {
+        return *media_box;
+    }
+    crate::geometry::Rect::from_points(x0, y0, x1, y1)
+}
+
+/// The page extent in points after the `/Rotate` turn, as `(width, height)`.
+///
+/// ISO 32000-1:2008 §7.7.3.3 Table 30: `/Rotate` is clockwise and a multiple
+/// of 90, so a quarter turn swaps the axes.
+pub(crate) fn rotated_page_extent(media_box: &crate::geometry::Rect, rotation: i32) -> (f32, f32) {
+    if rotation.rem_euclid(360) == 90 || rotation.rem_euclid(360) == 270 {
+        (media_box.height, media_box.width)
+    } else {
+        (media_box.width, media_box.height)
+    }
+}
+
+/// The page's base transform: PDF user space to device pixels, including the
+/// `/Rotate` turn and the y-up to y-down flip.
+///
+/// **Every case here has a negative determinant.** The flip from PDF's y-up
+/// user space to the raster's y-down rows contributes one reflection, and a
+/// quarter turn contributes none — so a matrix with a *positive* determinant
+/// is a mirror image, not a rotation. That is a cheap invariant to check and
+/// it is the one that failed: the composite renderer's 270° case was
+/// corrected to `from_row(0, -s, -s, 0, …)` (determinant −s²) and the
+/// separation renderer's copy was left as `from_row(0, s, -s, 0, …)`
+/// (determinant +s²), so every ink plate of a `/Rotate 270` page came out
+/// mirrored while the composite of the same page did not. Two renderers of
+/// one page disagreed, which is why this lives in one place now.
+///
+/// `rotation` may be negative — `/Rotate -90` is legal and means 270 — so it
+/// is normalised here rather than at each call site.
+pub(crate) fn page_base_transform(
+    media_box: &crate::geometry::Rect,
+    rotation: i32,
+    scale: f32,
+) -> tiny_skia::Transform {
+    use tiny_skia::Transform;
+    let origin = Transform::from_translate(-media_box.x, -media_box.y);
+    let (_, page_h) = rotated_page_extent(media_box, rotation);
+    match rotation.rem_euclid(360) {
+        // 90° CW: PDF (x, y) -> device (y·s, x·s).
+        90 => origin.post_concat(Transform::from_row(0.0, scale, scale, 0.0, 0.0, 0.0)),
+        180 => origin
+            .post_scale(-scale, scale)
+            .post_translate(media_box.width * scale, 0.0),
+        // 270° CW: PDF (x, y) -> device ((H − y)·s, (W − x)·s).
+        270 => origin.post_concat(Transform::from_row(
+            0.0,
+            -scale,
+            -scale,
+            0.0,
+            media_box.height * scale,
+            media_box.width * scale,
+        )),
+        _ => origin
+            .post_scale(scale, -scale)
+            .post_translate(0.0, page_h * scale),
+    }
+}
+
+/// How far a stroke's outline may reach from its centerline, in device
+/// units, before the width is narrowed. Measured separately from
+/// [`MAX_DEVICE_COORD`] because it is a separate failure: a 10x10 rect
+/// strokes correctly at width 1e9 (outline reach 5e9) and aborts the process
+/// at 1e10 (5e10), even though the centerline is only ten units across. 5e8
+/// keeps every width measured to rasterize, and its interior 5e8..5e10 is
+/// likewise unmeasured.
+const MAX_DEVICE_STROKE_REACH: f64 = 5.0e8;
+
+/// Device-space bounds of `path` as `[min_x, min_y, max_x, max_y]`. `None`
+/// when a corner is not finite — geometry we cannot place on the pixmap at
+/// all.
+fn device_bounds(path: &tiny_skia::Path, transform: tiny_skia::Transform) -> Option<[f64; 4]> {
+    let (sx, kx, ky, sy, tx, ty) = (
+        f64::from(transform.sx),
+        f64::from(transform.kx),
+        f64::from(transform.ky),
+        f64::from(transform.sy),
+        f64::from(transform.tx),
+        f64::from(transform.ty),
+    );
+    let b = path.bounds();
+    let (left, top) = (f64::from(b.left()), f64::from(b.top()));
+    let (right, bottom) = (f64::from(b.right()), f64::from(b.bottom()));
+    let mut out = [
+        f64::INFINITY,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    for (x, y) in [(left, top), (right, top), (left, bottom), (right, bottom)] {
+        let dx = sx * x + kx * y + tx;
+        let dy = ky * x + sy * y + ty;
+        if !dx.is_finite() || !dy.is_finite() {
+            return None;
+        }
+        out[0] = out[0].min(dx);
+        out[1] = out[1].min(dy);
+        out[2] = out[2].max(dx);
+        out[3] = out[3].max(dy);
+    }
+    Some(out)
+}
+
+/// Whether a path's device-space bounds are representable enough to
+/// rasterize. Used at the clip sites, which have no pixmap to cull against.
+pub(crate) fn device_bounds_rasterizable(
+    path: &tiny_skia::Path,
+    transform: tiny_skia::Transform,
+) -> bool {
+    device_bounds(path, transform).is_some_and(|b| b.iter().all(|c| c.abs() <= MAX_DEVICE_COORD))
+}
+
+/// Whether a path's device bounds lie wholly outside a `width` x `height`
+/// pixmap — i.e. the region it describes contains none of the page.
+///
+/// Used to tell two very different unrasterizable clips apart. A clip with
+/// enormous coordinates that still *encloses* the page restricts nothing that
+/// is visible, so discarding it is harmless. A clip placed far off-page
+/// excludes everything, and discarding it paints the entire page that the file
+/// asked to be hidden — ISO 32000-1:2008 §8.5.4 says content outside the
+/// clipping path shall not be painted, and a blank page is the correct output
+/// there. Annex C.1 licenses *having* an arithmetic limit; it does not license
+/// resolving past one in the direction that paints more.
+///
+/// `None` bounds (a non-finite corner) are not "outside" — nothing can be
+/// concluded about them, so they are left to the caller's fallback.
+pub(crate) fn device_bounds_miss_pixmap(
+    path: &tiny_skia::Path,
+    transform: tiny_skia::Transform,
+    width: u32,
+    height: u32,
+) -> bool {
+    device_bounds(path, transform).is_some_and(|[min_x, min_y, max_x, max_y]| {
+        max_x < 0.0 || max_y < 0.0 || min_x > f64::from(width) || min_y > f64::from(height)
+    })
+}
+
+/// Whether a draw is worth handing to tiny_skia for a `width` x `height`
+/// pixmap. Two independent questions that must not be conflated:
+///
+/// * Can the ink reach the pixmap? `device_reach` is how far the paint
+///   spreads past the path itself (nothing for a fill, the outline reach for
+///   a stroke). If it still misses, the draw paints nothing and dropping it
+///   is free. This is the only test the untrimmed bounds are entitled to
+///   fail — a box that runs off the page says nothing about whether the
+///   shape covers the page, and `0 0 1e8 1e8 re f` on a 100 x 100 page
+///   covers it completely.
+/// * Is the path itself inside [`MAX_DEVICE_COORD`]? Past that there is
+///   nothing the rasterizer can do with it. `device_reach` is deliberately
+///   NOT folded in here: it is bounded separately by
+///   [`MAX_DEVICE_STROKE_REACH`], and adding it would let a large CTM
+///   multiply a two-unit line width into a rejection of the whole draw.
+fn rasterizable_on(
+    path: &tiny_skia::Path,
+    transform: tiny_skia::Transform,
+    device_reach: f64,
+    width: u32,
+    height: u32,
+) -> bool {
+    let Some([x0, y0, x1, y1]) = device_bounds(path, transform) else {
+        return false;
+    };
+    if x1 + device_reach < 0.0
+        || y1 + device_reach < 0.0
+        || x0 - device_reach > f64::from(width)
+        || y0 - device_reach > f64::from(height)
+    {
+        return false;
+    }
+    x0.abs().max(x1.abs()) <= MAX_DEVICE_COORD && y0.abs().max(y1.abs()) <= MAX_DEVICE_COORD
+}
+
+/// Uniform scale factor `transform` applies, for converting a path-space
+/// line width into device units.
+fn device_scale(transform: tiny_skia::Transform) -> f64 {
+    let det = f64::from(transform.sx) * f64::from(transform.sy)
+        - f64::from(transform.kx) * f64::from(transform.ky);
+    det.abs().sqrt()
+}
+
+/// How far a stroke's outline reaches from its centerline, in path-space
+/// units. tiny_skia strokes in path space before applying the transform and
+/// expands the outline by up to `width/2 · miter_limit` at miter joins.
+fn stroke_reach(stroke: &tiny_skia::Stroke) -> f64 {
+    f64::from(stroke.width.abs()) / 2.0 * f64::from(stroke.miter_limit.max(1.0))
+}
+
+/// Narrows a stroke whose outline would reach past
+/// [`MAX_DEVICE_STROKE_REACH`], returning `None` when it already fits. A
+/// line that wide covers everything the pixmap can show anyway, so the width
+/// is capped rather than the stroke dropped: the only pixels this changes
+/// are further from the centerline than any pixmap reaches.
+fn clamp_stroke_reach(
+    stroke: &tiny_skia::Stroke,
+    transform: tiny_skia::Transform,
+) -> Option<tiny_skia::Stroke> {
+    let reach = stroke_reach(stroke) * device_scale(transform);
+    if !reach.is_finite() || reach <= MAX_DEVICE_STROKE_REACH {
+        return None;
+    }
+    let mut clamped = stroke.clone();
+    clamped.width = (f64::from(stroke.width.abs()) * MAX_DEVICE_STROKE_REACH / reach) as f32;
+    Some(clamped)
+}
+
+/// Choke point for handing a fill to tiny_skia: skips the draw when it
+/// misses the pixmap or its device-space bounds are beyond what the
+/// rasterizer can carry. All content-derived fills must route through here
+/// (or the mask/stroke siblings) rather than calling tiny_skia directly.
+pub(crate) fn guarded_fill_path(
+    pixmap: &mut tiny_skia::Pixmap,
+    path: &tiny_skia::Path,
+    paint: &Paint<'_>,
+    fill_rule: tiny_skia::FillRule,
+    transform: tiny_skia::Transform,
+    clip_mask: Option<&tiny_skia::Mask>,
+) {
+    if !rasterizable_on(path, transform, 0.0, pixmap.width(), pixmap.height()) {
+        log::debug!("skipping unrasterizable draw: {:?}", path.bounds());
+        return;
+    }
+    pixmap.fill_path(path, paint, fill_rule, transform, clip_mask);
+}
+
+/// Stroke sibling of [`guarded_fill_path`]. A line width whose outline runs
+/// past the rasterizer's reach is narrowed to one it can carry rather than
+/// costing the whole stroke.
+pub(crate) fn guarded_stroke_path(
+    pixmap: &mut tiny_skia::Pixmap,
+    path: &tiny_skia::Path,
+    paint: &Paint<'_>,
+    stroke: &tiny_skia::Stroke,
+    transform: tiny_skia::Transform,
+    clip_mask: Option<&tiny_skia::Mask>,
+) {
+    let clamped = clamp_stroke_reach(stroke, transform);
+    let stroke = clamped.as_ref().unwrap_or(stroke);
+    let reach = stroke_reach(stroke) * device_scale(transform);
+    if !rasterizable_on(path, transform, reach, pixmap.width(), pixmap.height()) {
+        log::debug!("skipping unrasterizable stroke: {:?}", path.bounds());
+        return;
+    }
+    pixmap.stroke_path(path, paint, stroke, transform, clip_mask);
+}
+
+/// Mask sibling of [`guarded_fill_path`]. A skipped path leaves the mask
+/// untouched, which for coverage masks means zero coverage — consistent
+/// with the paint itself being skipped.
+pub(crate) fn guarded_mask_fill_path(
+    mask: &mut tiny_skia::Mask,
+    path: &tiny_skia::Path,
+    fill_rule: tiny_skia::FillRule,
+    anti_alias: bool,
+    transform: tiny_skia::Transform,
+) {
+    if !rasterizable_on(path, transform, 0.0, mask.width(), mask.height()) {
+        log::debug!("skipping unrasterizable draw: {:?}", path.bounds());
+        return;
+    }
+    mask.fill_path(path, fill_rule, anti_alias, transform);
 }
 
 /// Returns `Some(mode)` when the PDF blend mode name is one of the four

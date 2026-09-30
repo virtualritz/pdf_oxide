@@ -128,6 +128,19 @@ namespace PdfOxide.Internal
             NativeHandle handle,
             out int errorCode);
 
+        // Structured diagnostics — JSON array; `category` tokens are open-ended.
+        [LibraryImport(LibName, EntryPoint = "pdf_document_structured_warnings", StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial IntPtr PdfDocumentStructuredWarnings(
+            NativeHandle handle,
+            out int errorCode);
+
+        [LibraryImport(LibName, EntryPoint = "pdf_document_take_structured_warnings", StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial IntPtr PdfDocumentTakeStructuredWarnings(
+            NativeHandle handle,
+            out int errorCode);
+
         [LibraryImport(LibName, EntryPoint = "pdf_document_extract_text_auto", StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial IntPtr PdfDocumentExtractTextAuto(
@@ -7122,6 +7135,23 @@ namespace PdfOxide.Internal
         [LibraryImport(LibName, EntryPoint = "pdf_oxide_element_get_rect", StringMarshalling = StringMarshalling.Utf8)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         public static partial void pdf_oxide_element_get_rect(
+            NativeHandle elements,
+            int index,
+            out float x,
+            out float y,
+            out float width,
+            out float height,
+            out int errorCode);
+
+        /// <summary>
+        /// Gets the page-space extents of an element: the rectangle from
+        /// <c>pdf_oxide_element_get_rect</c> with any text-matrix rotation resolved
+        /// into an axis-aligned page-space hull. Identical to
+        /// <c>pdf_oxide_element_get_rect</c> for upright runs.
+        /// </summary>
+        [LibraryImport(LibName, EntryPoint = "pdf_oxide_element_get_page_rect", StringMarshalling = StringMarshalling.Utf8)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        public static partial void pdf_oxide_element_get_page_rect(
             NativeHandle elements,
             int index,
             out float x,

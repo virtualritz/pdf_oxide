@@ -1053,6 +1053,20 @@ pub const Document = struct {
         return takeString(alloc, c.pdf_document_classify_document(self.handle, &code), code);
     }
 
+    /// The document's structured diagnostics as a raw JSON array ("[]" when
+    /// there are none); caller owns it. Non-destructive. Each entry's
+    /// `category` is an open-ended snake_case token — tolerate unknown ones.
+    pub fn structuredWarnings(self: Document, alloc: std.mem.Allocator) Error![]u8 {
+        var code: i32 = 0;
+        return takeString(alloc, c.pdf_document_structured_warnings(self.handle, &code), code);
+    }
+
+    /// As `structuredWarnings`, but drains: the returned entries are removed.
+    pub fn takeStructuredWarnings(self: Document, alloc: std.mem.Allocator) Error![]u8 {
+        var code: i32 = 0;
+        return takeString(alloc, c.pdf_document_take_structured_warnings(self.handle, &code), code);
+    }
+
     // ── PHASE-8: header / footer / artifact removal ───────────────────────────
 
     /// Erase the detected running header from a (0-based) page. Returns a status.
@@ -4111,6 +4125,21 @@ pub const ElementList = struct {
         return .{ .x = x, .y = y, .width = w, .height = ht };
     }
 
+    /// Page-space extents of the element at `index`: the rect from `getRect`
+    /// with any text-matrix rotation resolved into an axis-aligned page-space
+    /// hull. Identical to `getRect` for upright runs.
+    pub fn getPageRect(self: ElementList, index: i32) Error!Bbox {
+        const h = try self.live();
+        var code: i32 = 0;
+        var x: f32 = 0;
+        var y: f32 = 0;
+        var w: f32 = 0;
+        var ht: f32 = 0;
+        c.pdf_oxide_element_get_page_rect(h, index, &x, &y, &w, &ht, &code);
+        if (code != 0) return fail(code);
+        return .{ .x = x, .y = y, .width = w, .height = ht };
+    }
+
     /// Serialize the whole list to a JSON string; caller owns the returned slice.
     pub fn toJson(self: ElementList, alloc: std.mem.Allocator) Error![]u8 {
         const h = try self.live();
@@ -4850,7 +4879,10 @@ test "phase-7 page getters: width/height/rotation/elements" {
         defer a.free(t);
         const txt = try els.getText(a, 0); // getText
         defer a.free(txt);
-        _ = try els.getRect(0); // getRect
+        const rect = try els.getRect(0); // getRect
+        const page_rect = try els.getPageRect(0); // getPageRect
+        // The sample page is upright, so the two rects agree.
+        try testing.expectEqual(rect, page_rect);
     }
     const json = try els.toJson(a); // toJson
     defer a.free(json);

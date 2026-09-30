@@ -170,6 +170,32 @@ module PdfOxide
       StringMarshaller.from_c_string(ptr) || ''
     end
 
+    # This document's structured diagnostics, as a raw JSON array string
+    # (`"[]"` when there are none). Non-destructive: a later call returns
+    # the same entries plus any raised since.
+    #
+    # Left unparsed on purpose: each entry's `category` is an open-ended
+    # snake_case token and new ones ship in minor releases, so callers
+    # must tolerate tokens they do not know.
+    # @return [String] JSON array.
+    def structured_warnings
+      err = ::FFI::MemoryPointer.new(:int32)
+      ptr = Bindings.pdf_document_structured_warnings(handle, err)
+      raise_for_code(err.read_int32, 'structured_warnings')
+      StringMarshaller.from_c_string(ptr) || ''
+    end
+
+    # As {#structured_warnings}, but drains: the returned entries are
+    # removed, so a batch pipeline can read per document without the sink
+    # growing across the run.
+    # @return [String] JSON array.
+    def take_structured_warnings
+      err = ::FFI::MemoryPointer.new(:int32)
+      ptr = Bindings.pdf_document_take_structured_warnings(handle, err)
+      raise_for_code(err.read_int32, 'take_structured_warnings')
+      StringMarshaller.from_c_string(ptr) || ''
+    end
+
     # Convert one page to Markdown.
     # @param page_index [Integer]
     # @return [String] Markdown.
@@ -438,26 +464,19 @@ module PdfOxide
     end
 
     def read_rendered_image_bytes(img_ptr)
-      # The cdylib renders to a "rendered image" handle.  Different
-      # accessors exist across versions; try the byte-buffer accessor
-      # first, fall back to a sensible default.
-      if Bindings.respond_to?(:pdf_oxide_rendered_image_get_bytes)
-        len_ptr = ::FFI::MemoryPointer.new(:size_t)
-        err = ::FFI::MemoryPointer.new(:int32)
-        buf = Bindings.pdf_oxide_rendered_image_get_bytes(img_ptr, len_ptr, err)
-        raise_for_code(err.read_int32, 'render_bytes')
-        return '' if buf.nil? || buf.null?
+      # The cdylib exposes the rendered-image byte buffer through
+      # pdf_get_rendered_image_data (data_len is *mut i32, not size_t);
+      # the caller owns the returned buffer and must free it via
+      # free_bytes.
+      len_ptr = ::FFI::MemoryPointer.new(:int32)
+      err = ::FFI::MemoryPointer.new(:int32)
+      buf = Bindings.pdf_get_rendered_image_data(img_ptr, len_ptr, err)
+      raise_for_code(err.read_int32, 'render_bytes')
+      return '' if buf.nil? || buf.null?
 
-        len = len_ptr.read(:size_t)
-        bytes = buf.read_string(len)
-        Bindings.free_bytes(buf) if Bindings.respond_to?(:free_bytes)
-        bytes
-      else
-        # Fall back to an empty BINARY string; render() callers see a
-        # clean error path rather than a segfault when the build is
-        # missing the rendered-image accessor.
-        ''
-      end
+      bytes = buf.read_string(len_ptr.read_int32)
+      Bindings.free_bytes(buf)
+      bytes
     end
 
     # Map a cdylib error code (`int32_t *err`) to the matching Ruby

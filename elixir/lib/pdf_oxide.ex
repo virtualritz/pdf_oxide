@@ -1850,6 +1850,17 @@ defmodule PdfOxide do
   @doc "Classify the whole document (returns a JSON classification string)."
   def classify_document(%Document{ref: ref}), do: Native.doc_classify_document(ref)
 
+  @doc """
+  The document's structured diagnostics as a raw JSON array string (`"[]"` when
+  there are none). Non-destructive: a later call returns the same entries plus
+  any raised since. Each entry's `category` is an open-ended snake_case token —
+  tolerate tokens you do not know.
+  """
+  def structured_warnings(%Document{ref: ref}), do: Native.doc_structured_warnings(ref)
+  @doc "As `structured_warnings/1`, but drains: the returned entries are removed."
+  def take_structured_warnings(%Document{ref: ref}),
+    do: Native.doc_take_structured_warnings(ref)
+
   # ── phase 8: header / footer / artifact ───────────────────────────────────────
   @doc "Erase the detected header on a (0-based) `page`. Returns the erased count."
   def erase_header(%Document{ref: ref}, page), do: Native.doc_erase_header(ref, page)
@@ -2008,6 +2019,15 @@ defmodule PdfOxide do
   @doc "Bounding box of the element at `index` in an `ElementList` as a `Bbox`."
   def element_rect(%ElementList{ref: ref}, index),
     do: wrap_box(Native.element_get_rect(ref, index))
+
+  @doc """
+  Page-space extents of the element at `index` in an `ElementList` as a `Bbox`.
+
+  The rect from `element_rect/2` with any text-matrix rotation resolved into an
+  axis-aligned page-space hull. Identical to `element_rect/2` for upright runs.
+  """
+  def element_page_rect(%ElementList{ref: ref}, index),
+    do: wrap_box(Native.element_get_page_rect(ref, index))
 
   @doc "An `ElementList` serialized as a JSON string."
   def elements_to_json(%ElementList{ref: ref}), do: Native.elements_to_json(ref)

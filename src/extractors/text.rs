@@ -12,11 +12,28 @@ use crate::content::graphics_state::{GraphicsStateStack, Matrix};
 use crate::content::operators::{Operator, TextElement};
 use crate::content::parse_and_execute_text_only;
 use crate::content::parse_content_stream;
-use crate::content::parse_content_stream_text_only;
 use crate::error::Result;
 use crate::extract_log_debug;
+use crate::fonts::unicode_decode::{fallback_char_to_unicode, DecodePolicy, TextCharIter};
 use crate::fonts::FontInfo;
 use crate::geometry::Rect;
+
+/// Decode a show string the way extraction reads it.
+///
+/// Extraction keeps an unmapped code when the caller asked for it, leaves
+/// ligatures whole for `ligature_processor` to expand, and writes a question
+/// mark for a code no table resolves.
+fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
+    crate::fonts::unicode_decode::decode_text_to_unicode(
+        bytes,
+        font,
+        DecodePolicy {
+            preserve_unmapped: preserve_unmapped_glyphs(),
+            decompose_ligatures: false,
+            question_mark_for_invalid: true,
+        },
+    )
+}
 use crate::layout::{Color, FontWeight, TextChar, TextSpan};
 use crate::object::{Object, ObjectRef};
 use crate::pipeline::config::WordBoundaryMode;
@@ -1899,6 +1916,10 @@ struct TjBuffer {
     /// Display rotation of this run in degrees, snapped to a quadrant when near
     /// one; `0.0` for ordinary horizontal text (see `snap_run_rotation`).
     rotation_degrees: f32,
+    /// Negative determinant of the composed matrix — mirrored text (see
+    /// `run_is_mirrored`), carried onto the emitted span so `page_bbox`
+    /// reflects rather than rotates its across-axis.
+    mirrored: bool,
     /// Writing mode (0 = horizontal, 1 = vertical) captured from the
     /// graphics state when the buffer started, so each emitted span
     /// carries the wmode it was rendered under. A font change flushes the
@@ -1928,9 +1949,12 @@ struct TjBuffer {
 fn snap_run_rotation(combined: &Matrix) -> f32 {
     const SNAP_TOL_DEG: f32 = 5.0;
     let (a, b, c, d) = (combined.a, combined.b, combined.c, combined.d);
-    // Pure horizontal fast path (covers virtually all text): b and c ~ 0.
+    // Pure horizontal/180° fast path: b and c ~ 0 covers both 0° (a,d > 0)
+    // and 180° (a,d < 0) — sin(0°) and sin(180°) are both 0, so the
+    // off-diagonal terms alone can't tell them apart. Check the sign of
+    // `a` (cos(0°)=1, cos(180°)=-1) to disambiguate.
     if b.abs() < 1e-4 && c.abs() < 1e-4 {
-        return 0.0;
+        return if a < 0.0 { 180.0 } else { 0.0 };
     }
     let mut deg = b.atan2(a).to_degrees();
     // Normalise to (-180, 180].
@@ -1955,6 +1979,13 @@ fn snap_run_rotation(combined: &Matrix) -> f32 {
     deg
 }
 
+/// Negative determinant of the composed text rendering matrix: the run is
+/// mirrored, so `rotation_degrees` alone cannot describe its frame (a mirrored
+/// 90° run and a clean 90° run carry the same angle but opposite across-axes).
+fn run_is_mirrored(combined: &Matrix) -> bool {
+    combined.a * combined.d - combined.b * combined.c < 0.0
+}
+
 impl TjBuffer {
     /// Create a new empty buffer with current state.
     fn new(
@@ -1973,16 +2004,33 @@ impl TjBuffer {
             _ => FontWeight::Normal,
         };
         let is_italic = cached_font.as_ref().map(|f| f.is_italic()).unwrap_or(false);
-        let is_monospace = cached_font.as_ref().is_some_and(|f| {
-            if f.flags.is_some_and(|flags| flags & 1 != 0) {
-                return true;
-            }
-            let name = f.base_font.to_uppercase();
-            name.contains("COURIER")
-                || name.contains("CONSOLAS")
-                || name.contains("MONO")
-                || name.contains("FIXED")
-        });
+        // Invisible text (Tr 3/7, ISO 32000-1 §9.3.6) is never real visible
+        // monospace content — it's an OCR text-sandwich layer sitting under
+        // a scanned page image, or deliberately hidden text. Such layers
+        // commonly use a synthetic font (conventionally named
+        // "GlyphLessFont" by ocrmypdf/Tesseract and similar tools) whose
+        // FontDescriptor sets the FixedPitch flag purely for positioning
+        // simplicity — the glyphs are never rendered, so "monospace" has no
+        // visual meaning to categorize by. Downstream markdown conversion
+        // uses `is_monospace` to fence a line/paragraph as a code block; an
+        // OCR'd scanned novel's dialogue tripping this on FixedPitch alone
+        // fences narrative prose as code (#1024).
+        let is_invisible_or_glyphless = state.render_mode == 3
+            || state.render_mode == 7
+            || cached_font
+                .as_ref()
+                .is_some_and(|f| f.base_font.to_uppercase().contains("GLYPHLESS"));
+        let is_monospace = !is_invisible_or_glyphless
+            && cached_font.as_ref().is_some_and(|f| {
+                if f.flags.is_some_and(|flags| flags & 1 != 0) {
+                    return true;
+                }
+                let name = f.base_font.to_uppercase();
+                name.contains("COURIER")
+                    || name.contains("CONSOLAS")
+                    || name.contains("MONO")
+                    || name.contains("FIXED")
+            });
         let rotation_degrees = snap_run_rotation(&combined);
         // Pre-compute user-space position: text_matrix origin → CTM transform
         let text_pos = state.text_matrix.transform_point(0.0, 0.0);
@@ -2007,6 +2055,7 @@ impl TjBuffer {
             user_pos_y: user_pos.y,
             user_h_scale,
             rotation_degrees,
+            mirrored: run_is_mirrored(&combined),
             wmode: state.text_wmode,
             text_rise: if state.font_size > 0.0 {
                 state.text_rise / state.font_size
@@ -2097,384 +2146,6 @@ impl TjBuffer {
 
         Ok(())
     }
-}
-
-/// Fallback function to map common character codes to Unicode when ToUnicode CMap fails.
-///
-/// PDF Spec Compliance: ISO 32000-1:2008 Section 9.10.2
-/// This function implements Priority 6 (enhanced fallback) after the standard 5-tier
-/// encoding system (ToUnicode CMap, predefined encodings, Adobe Glyph List, etc.) fails.
-///
-/// Multi-tier fallback strategy:
-/// 1. Common punctuation and symbols (em dash, en dash, quotes, bullets)
-/// 2. Mathematical operators (∂, ∇, ∑, ∏, ∫, √, ∞, ≤, ≥, ≠)
-/// 3. Greek letters (α, β, γ, δ, θ, λ, μ, π, σ, ω - both cases)
-/// 4. Currency symbols (€, £, ¥, ¢)
-/// 5. Direct Unicode (if char_code is in valid Unicode range)
-/// 6. Private Use Area visual description (U+E000-U+F8FF)
-/// 7. Replacement character "?" as last resort
-///
-/// # Arguments
-/// * `char_code` - 16-bit character code that failed to decode via standard system
-///
-/// # Returns
-/// Best-effort Unicode string representation, or "?" if no mapping possible
-fn fallback_char_to_unicode(char_code: u32) -> String {
-    match char_code {
-        // ==================================================================================
-        // PRIORITY 1: Common Punctuation (most frequently failing)
-        // ==================================================================================
-        0x2014 => "—".to_string(),        // Em dash
-        0x2013 => "–".to_string(),        // En dash
-        0x2018 => "\u{2018}".to_string(), // Left single quotation mark (')
-        0x2019 => "\u{2019}".to_string(), // Right single quotation mark (')
-        0x201C => "\u{201C}".to_string(), // Left double quotation mark (")
-        0x201D => "\u{201D}".to_string(), // Right double quotation mark (")
-        0x2022 => "•".to_string(),        // Bullet
-        0x2026 => "…".to_string(),        // Horizontal ellipsis
-        0x00B0 => "°".to_string(),        // Degree sign
-
-        // ==================================================================================
-        // PRIORITY 2: Mathematical Operators (common in academic papers)
-        // ==================================================================================
-        0x00B1 => "±".to_string(), // Plus-minus sign
-        0x00D7 => "×".to_string(), // Multiplication sign
-        0x00F7 => "÷".to_string(), // Division sign
-        0x2202 => "∂".to_string(), // Partial differential
-        0x2207 => "∇".to_string(), // Nabla (del operator)
-        0x220F => "∏".to_string(), // N-ary product
-        0x2211 => "∑".to_string(), // N-ary summation
-        0x221A => "√".to_string(), // Square root
-        0x221E => "∞".to_string(), // Infinity
-        0x2260 => "≠".to_string(), // Not equal to
-        0x2261 => "≡".to_string(), // Identical to
-        0x2264 => "≤".to_string(), // Less-than or equal to
-        0x2265 => "≥".to_string(), // Greater-than or equal to
-        0x222B => "∫".to_string(), // Integral
-        0x2248 => "≈".to_string(), // Almost equal to
-        0x2282 => "⊂".to_string(), // Subset of
-        0x2283 => "⊃".to_string(), // Superset of
-        0x2286 => "⊆".to_string(), // Subset of or equal to
-        0x2287 => "⊇".to_string(), // Superset of or equal to
-        0x2208 => "∈".to_string(), // Element of
-        0x2209 => "∉".to_string(), // Not an element of
-        0x2200 => "∀".to_string(), // For all
-        0x2203 => "∃".to_string(), // There exists
-        0x2205 => "∅".to_string(), // Empty set
-        0x2227 => "∧".to_string(), // Logical and
-        0x2228 => "∨".to_string(), // Logical or
-        0x00AC => "¬".to_string(), // Not sign
-        0x2192 => "→".to_string(), // Rightwards arrow
-        0x2190 => "←".to_string(), // Leftwards arrow
-        0x2194 => "↔".to_string(), // Left right arrow
-        0x21D2 => "⇒".to_string(), // Rightwards double arrow
-        0x21D4 => "⇔".to_string(), // Left right double arrow
-
-        // ==================================================================================
-        // PRIORITY 3: Greek Letters (common in scientific/mathematical texts)
-        // ==================================================================================
-        // Lowercase Greek
-        0x03B1 => "α".to_string(), // Alpha
-        0x03B2 => "β".to_string(), // Beta
-        0x03B3 => "γ".to_string(), // Gamma
-        0x03B4 => "δ".to_string(), // Delta
-        0x03B5 => "ε".to_string(), // Epsilon
-        0x03B6 => "ζ".to_string(), // Zeta
-        0x03B7 => "η".to_string(), // Eta
-        0x03B8 => "θ".to_string(), // Theta
-        0x03B9 => "ι".to_string(), // Iota
-        0x03BA => "κ".to_string(), // Kappa
-        0x03BB => "λ".to_string(), // Lambda
-        0x03BC => "μ".to_string(), // Mu
-        0x03BD => "ν".to_string(), // Nu
-        0x03BE => "ξ".to_string(), // Xi
-        0x03BF => "ο".to_string(), // Omicron
-        0x03C0 => "π".to_string(), // Pi
-        0x03C1 => "ρ".to_string(), // Rho
-        0x03C2 => "ς".to_string(), // Final sigma
-        0x03C3 => "σ".to_string(), // Sigma
-        0x03C4 => "τ".to_string(), // Tau
-        0x03C5 => "υ".to_string(), // Upsilon
-        0x03C6 => "φ".to_string(), // Phi
-        0x03C7 => "χ".to_string(), // Chi
-        0x03C8 => "ψ".to_string(), // Psi
-        0x03C9 => "ω".to_string(), // Omega
-
-        // Uppercase Greek
-        0x0391 => "Α".to_string(), // Alpha
-        0x0392 => "Β".to_string(), // Beta
-        0x0393 => "Γ".to_string(), // Gamma
-        0x0394 => "Δ".to_string(), // Delta
-        0x0395 => "Ε".to_string(), // Epsilon
-        0x0396 => "Ζ".to_string(), // Zeta
-        0x0397 => "Η".to_string(), // Eta
-        0x0398 => "Θ".to_string(), // Theta
-        0x0399 => "Ι".to_string(), // Iota
-        0x039A => "Κ".to_string(), // Kappa
-        0x039B => "Λ".to_string(), // Lambda
-        0x039C => "Μ".to_string(), // Mu
-        0x039D => "Ν".to_string(), // Nu
-        0x039E => "Ξ".to_string(), // Xi
-        0x039F => "Ο".to_string(), // Omicron
-        0x03A0 => "Π".to_string(), // Pi
-        0x03A1 => "Ρ".to_string(), // Rho
-        0x03A3 => "Σ".to_string(), // Sigma
-        0x03A4 => "Τ".to_string(), // Tau
-        0x03A5 => "Υ".to_string(), // Upsilon
-        0x03A6 => "Φ".to_string(), // Phi
-        0x03A7 => "Χ".to_string(), // Chi
-        0x03A8 => "Ψ".to_string(), // Psi
-        0x03A9 => "Ω".to_string(), // Omega
-
-        // ==================================================================================
-        // PRIORITY 4: Currency Symbols
-        // ==================================================================================
-        0x20AC => "€".to_string(), // Euro
-        0x00A3 => "£".to_string(), // Pound sterling
-        0x00A5 => "¥".to_string(), // Yen
-        0x00A2 => "¢".to_string(), // Cent
-        0x20A3 => "₣".to_string(), // French franc
-        0x20A4 => "₤".to_string(), // Lira
-        0x20A9 => "₩".to_string(), // Won
-        0x20AA => "₪".to_string(), // New shekel
-        0x20AB => "₫".to_string(), // Dong
-        0x20B9 => "₹".to_string(), // Indian rupee
-
-        // ==================================================================================
-        // PRIORITY 5: Direct Unicode (for valid ranges)
-        // ==================================================================================
-        // Valid Unicode: BMP (0x0000-0xD7FF, 0xE000-0xFFFF) and supplementary planes
-        // Excludes surrogate pairs (0xD800-0xDFFF)
-        code => {
-            if let Some(ch) = char::from_u32(code) {
-                if (0xE000..=0xF8FF).contains(&code) {
-                    log::debug!("Private Use Area character: U+{:04X}", code);
-                }
-                ch.to_string()
-            } else {
-                log::warn!("Character code 0x{:04X} is not a valid Unicode code point", code);
-                "?".to_string()
-            }
-        },
-    }
-}
-
-/// Byte grouping mode for CID font character code decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ByteMode {
-    /// Single-byte codes (simple fonts, some predefined CMaps)
-    OneByte,
-    /// Always 2-byte codes (Identity-H/V, UCS2)
-    TwoByte,
-    /// Shift-JIS variable-width (1 or 2 bytes depending on lead byte)
-    ShiftJIS,
-}
-
-/// True when a Type0 font's `/Encoding` is a UTF-8 (variable-width) CMap —
-/// `Uni-Utf8-H` (embedded, pdf.js issue18117) or the Adobe predefined
-/// `UniGB-UTF8-H` / `UniCNS-UTF8-H` / `UniJIS-UTF8-H` / `UniKS-UTF8-H` family.
-/// Such codes are 1–4 bytes and must be segmented by UTF-8 lead-byte rules
-/// (see `decode_text_to_unicode`), not the fixed 1/2-byte `ByteMode`. Matching
-/// on the CMap name keeps the change isolated to these fonts. See #610.
-fn font_has_utf8_cmap(font: &FontInfo) -> bool {
-    if font.subtype != "Type0" {
-        return false;
-    }
-    if let crate::fonts::Encoding::Standard(name) = &font.encoding {
-        let lower = name.to_ascii_lowercase();
-        lower.contains("utf8") || lower.contains("utf-8")
-    } else {
-        false
-    }
-}
-
-/// Get byte grouping mode for a font (v0.3.14).
-fn get_byte_mode(font: Option<&FontInfo>) -> ByteMode {
-    if let Some(font) = font {
-        if font.subtype == "Type0" {
-            // If the ToUnicode CMap declares a 2-byte codespace range, always use
-            // TwoByte mode regardless of the encoding name. This handles CJK fonts
-            // whose /Encoding name is a custom CMap stream that doesn't match the
-            // well-known keyword patterns below (e.g. "H", "V", "UniCNS-H", …).
-            // See PDF Spec §9.7.5 — `begincodespacerange` is authoritative.
-            if let Some(ref lazy_cmap) = font.to_unicode {
-                if lazy_cmap.code_width() == 2 {
-                    return ByteMode::TwoByte;
-                }
-            }
-
-            match &font.encoding {
-                crate::fonts::Encoding::Identity => ByteMode::TwoByte,
-                crate::fonts::Encoding::Standard(name) => {
-                    if (name.contains("Identity") && !name.contains("OneByteIdentity"))
-                        || name.contains("UCS2")
-                        || name.contains("UTF16")
-                        // CORPUS-3: bare Adobe predefined horizontal/vertical CMaps
-                        // ("H"/"V", e.g. Adobe-Japan1-H) are 2-byte by definition;
-                        // without this they were read single-byte → CJK garbage
-                        // ("あいうえお" → "CACCCECGCI" on noembed-jis7).
-                        || name == "H"
-                        || name == "V"
-                    {
-                        ByteMode::TwoByte
-                    } else if name.contains("RKSJ") {
-                        ByteMode::ShiftJIS
-                    } else if name.contains("EUC")
-                        || name.contains("GBK")
-                        || name.contains("GBpc")
-                        || name.contains("GB-")
-                        || name.contains("CNS")
-                        || name.contains("B5")
-                        || name.contains("KSC")
-                        || name.contains("KSCms")
-                    {
-                        ByteMode::TwoByte
-                    } else {
-                        ByteMode::OneByte
-                    }
-                },
-                _ => ByteMode::OneByte,
-            }
-        } else {
-            ByteMode::OneByte
-        }
-    } else {
-        ByteMode::OneByte
-    }
-}
-
-/// Iterator over characters in a PDF string based on font encoding (v0.3.14).
-struct TextCharIter<'a> {
-    bytes: &'a [u8],
-    byte_mode: ByteMode,
-    index: usize,
-}
-
-impl<'a> TextCharIter<'a> {
-    fn new(bytes: &'a [u8], font: Option<&FontInfo>) -> Self {
-        Self {
-            bytes,
-            byte_mode: get_byte_mode(font),
-            index: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for TextCharIter<'a> {
-    type Item = (u16, usize); // (char_code, bytes_consumed)
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index >= self.bytes.len() {
-            return None;
-        }
-
-        let (char_code, bytes_consumed) = match self.byte_mode {
-            ByteMode::TwoByte if self.index + 1 < self.bytes.len() => {
-                (((self.bytes[self.index] as u16) << 8) | (self.bytes[self.index + 1] as u16), 2)
-            },
-            ByteMode::ShiftJIS => {
-                let b = self.bytes[self.index];
-                let is_lead = (0x81..=0x9F).contains(&b) || (0xE0..=0xFC).contains(&b);
-                if is_lead && self.index + 1 < self.bytes.len() {
-                    (((b as u16) << 8) | (self.bytes[self.index + 1] as u16), 2)
-                } else {
-                    (b as u16, 1)
-                }
-            },
-            _ => (self.bytes[self.index] as u16, 1),
-        };
-
-        self.index += bytes_consumed;
-        Some((char_code, bytes_consumed))
-    }
-}
-
-fn decode_text_to_unicode(bytes: &[u8], font: Option<&FontInfo>) -> String {
-    let raw_result = if let Some(font) = font {
-        let mut result = String::new();
-        // Use pre-computed lookup table for performance if it's a simple font
-        if font.subtype != "Type0" {
-            let table = font.get_byte_to_char_table();
-            for &byte in bytes {
-                let c = table[byte as usize];
-                if c != '\0' {
-                    result.push(c);
-                } else {
-                    // Fallback: multi-char mapping or unmapped byte
-                    let char_str = font
-                        .char_to_unicode(byte as u32)
-                        .unwrap_or_else(|| fallback_char_to_unicode(byte as u32));
-                    if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
-                        result.push_str(&char_str);
-                    }
-                }
-            }
-        } else if font_has_utf8_cmap(font) {
-            // Type0 font whose /Encoding is an embedded CMap with a UTF-8
-            // (variable-width) codespace — e.g. `Uni-Utf8-H` (pdf.js
-            // issue18117) and the Adobe predefined `Uni*-UTF8-H` family.
-            // Codes are 1–4 bytes segmented by UTF-8 lead-byte rules, which
-            // exceed the u16 of `TextCharIter`. Segment here into u32 codes
-            // and resolve via the (present) ToUnicode CMap, which is keyed by
-            // the same multi-byte codes. Isolated to UTF-8-CMap fonts: every
-            // other font keeps the path below unchanged. See #610.
-            let n = bytes.len();
-            let mut i = 0;
-            while i < n {
-                let lead = bytes[i];
-                let width = match lead {
-                    0x00..=0x7F => 1,
-                    0xC0..=0xDF => 2,
-                    0xE0..=0xEF => 3,
-                    0xF0..=0xF7 => 4,
-                    _ => 1, // invalid lead byte → consume one, avoids stalling
-                }
-                .min(n - i);
-                let mut code: u32 = 0;
-                for &b in &bytes[i..i + width] {
-                    code = (code << 8) | b as u32;
-                }
-                let char_str = font
-                    .char_to_unicode(code)
-                    .unwrap_or_else(|| fallback_char_to_unicode(code));
-                if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
-                    result.push_str(&char_str);
-                }
-                i += width;
-            }
-        } else {
-            // Complex font: use unified iterator for robust multi-byte decoding
-            for (char_code, _) in TextCharIter::new(bytes, Some(font)) {
-                let char_str = font
-                    .char_to_unicode(char_code as u32)
-                    .unwrap_or_else(|| fallback_char_to_unicode(char_code as u32));
-
-                if char_str != "\u{FFFD}" || preserve_unmapped_glyphs() {
-                    result.push_str(&char_str);
-                }
-            }
-        }
-        result
-    } else {
-        // No font - fallback to Latin-1 (ISO 8859-1) encoding
-        // Per PDF Spec ISO 32000-1:2008, Section 9.6.6, Latin-1 maps bytes 0x00-0xFF
-        // directly to Unicode code points U+0000-U+00FF
-        log::warn!(
-            "⚠️  No font provided for {} bytes, using Latin-1 fallback (PDF spec compliant)",
-            bytes.len()
-        );
-        bytes.iter().map(|&b| char::from(b)).collect()
-    };
-
-    // Filter control characters from failed encoding resolution
-    // Keep: \t (0x09), \n (0x0A), \r (0x0D), and all printable chars (>= 0x20)
-    let mut filtered = String::with_capacity(raw_result.len());
-    for c in raw_result.chars() {
-        if c >= '\x20' || c == '\t' || c == '\n' || c == '\r' {
-            filtered.push(c);
-        }
-    }
-    filtered
 }
 
 /// Artifact type classification per PDF Spec Section 14.8.2.2
@@ -3257,14 +2928,41 @@ impl<'doc> TextExtractor<'doc> {
         // or larger. Keep it unless a majority of the placed words also appear
         // outside (a duplicate overlay). Tokenising here (behind gates 1 and 2)
         // keeps the common single-column path allocation-free.
-        Self::text_duplication_fraction(&placed_txt, &other_txt) < MAX_DUP_FRACTION
+        match Self::text_duplication_fraction(&placed_txt, &other_txt) {
+            // No tokens could be read out of the placed operands, so there is
+            // no evidence either way — and "no evidence" must not read as "not
+            // a duplicate". The operands carry encoded character codes, not
+            // text: under Identity-H, the dominant modern encoding for exactly
+            // the producer this gate targets, the bytes are two-byte CIDs and
+            // no run of ASCII alphanumerics forms. The measured duplication was
+            // then 0.0, the gate kept, and `extract_text` emitted every word
+            // twice — precisely the case the suppression exists to prevent.
+            //
+            // Failing closed suppresses instead. Gate 2 above already keeps a
+            // placed body that dominates the page whatever its encoding, so
+            // what reaches here is placed text of comparable size to the rest
+            // of the page, where a duplicate overlay is the likely reading.
+            //
+            // The real discriminator is bounding-box overlap, which exists
+            // downstream and is not consulted here; decoding the operand
+            // through the font before tokenising would also settle it. Either
+            // is a larger change than this gate.
+            None => false,
+            Some(fraction) => fraction < MAX_DUP_FRACTION,
+        }
     }
 
     /// Fraction of alphanumeric word tokens in `a` (counting repeats) that also
     /// occur anywhere in `b`. Words are lowercased runs of >= 2 alphanumeric
-    /// bytes; punctuation and single characters are ignored. Returns 0.0 when `a`
-    /// has no such tokens (nothing to be a duplicate of).
-    fn text_duplication_fraction(a: &[u8], b: &[u8]) -> f64 {
+    /// bytes; punctuation and single characters are ignored.
+    ///
+    /// Returns `None` when `a` yields no tokens at all. That is not "nothing to
+    /// be a duplicate of" — these are raw show operands, i.e. encoded character
+    /// codes rather than text, so an encoding whose codes are not ASCII
+    /// alphanumerics (Identity-H, and any non-Latin script) produces no tokens
+    /// from text that is certainly there. The caller must treat it as absence
+    /// of evidence, not as evidence of absence.
+    fn text_duplication_fraction(a: &[u8], b: &[u8]) -> Option<f64> {
         fn tokens(bytes: &[u8]) -> Vec<Vec<u8>> {
             let mut out = Vec::new();
             let mut cur = Vec::new();
@@ -3286,11 +2984,11 @@ impl<'doc> TextExtractor<'doc> {
         }
         let a_tokens = tokens(a);
         if a_tokens.is_empty() {
-            return 0.0;
+            return None;
         }
         let b_set: std::collections::HashSet<Vec<u8>> = tokens(b).into_iter().collect();
         let shared = a_tokens.iter().filter(|t| b_set.contains(*t)).count();
-        shared as f64 / a_tokens.len() as f64
+        Some(shared as f64 / a_tokens.len() as f64)
     }
 
     /// Parse artifact type and subtype from artifact properties dictionary.
@@ -3759,16 +3457,7 @@ impl<'doc> TextExtractor<'doc> {
         self.placed_pdf_keep = Self::placed_pdf_text_dominates(content_stream);
 
         extract_log_debug!("Parsing content stream for text extraction");
-        if self.excluded_inks.is_empty() {
-            parse_and_execute_text_only(content_stream, |op| self.execute_operator(op))?;
-        } else {
-            // Ink filtering requires color operators (cs, rg, g, k) which the
-            // text-only parser skips. Fall back to the full parser.
-            let operators = parse_content_stream(content_stream)?;
-            for op in operators {
-                self.execute_operator(op)?;
-            }
-        }
+        self.run_content_stream(content_stream)?;
 
         // Flush any remaining Tj buffer at end of content stream
         self.flush_tj_span_buffer()?;
@@ -3849,6 +3538,57 @@ impl<'doc> TextExtractor<'doc> {
         Ok(std::mem::take(&mut self.spans))
     }
 
+    /// Feed a content stream's operators to `execute_operator`.
+    ///
+    /// The single parser dispatch for every extraction mode (chars, spans,
+    /// Form XObject recursion). The modes must differ only in how
+    /// `execute_operator` handles the show-text operators, never in which
+    /// operators reach it: char and span mode once used different parsers
+    /// (`parse_content_stream_text_only` vs `parse_and_execute_text_only`),
+    /// which reconstruct the graphics state around a text region by different
+    /// routes, so they could agree on every text operator and still hand the
+    /// extractor a different CTM. On govdocs_003_003181.pdf page 4 that cost
+    /// a 90°-rotated chart axis: char mode returned 2322 glyphs, all at
+    /// rotation 0, where span mode saw 2590 glyphs, 122 at 90°.
+    /// Whether this extraction carries an **emission filter** — a caller
+    /// decision about what to leave out of the result.
+    ///
+    /// Every such filter is evaluated against interpreted state that the
+    /// text-only parser's >256 KB prescan route does not deliver: it keeps
+    /// only `BT..ET`/`Do` regions and discards everything between them.
+    /// Ink filtering needs the colour operators (`cs`, `rg`, `g`, `k`); layer
+    /// exclusion needs the `BDC`/`EMC` pairs that carry optional-content
+    /// membership. Both must therefore take the full parser.
+    ///
+    /// This is one predicate rather than a condition per filter because the
+    /// list had already been forgotten once: the gate tested inks alone, so
+    /// `set_excluded_layers()` was silently ignored above the threshold — the
+    /// caller asked for exclusion, got no error, and got the content. A new
+    /// filter is added here, with its reason, or it inherits the same defect.
+    ///
+    /// This localises the class; it does not close it. ISO 32000-1:2008
+    /// §8.11.3 requires that when optional content is hidden "the content
+    /// shall not be drawn" while "graphics state operations … shall still be
+    /// applied", so visibility is a decision about marking the page, taken
+    /// after interpretation — never a licence to stop parsing. The structural
+    /// answer is one sequential interpreter with suppression at emission,
+    /// which retires this predicate along with the prescan branch.
+    fn has_emission_filter(&self) -> bool {
+        !self.excluded_inks.is_empty() || !self.excluded_layers.is_empty()
+    }
+
+    fn run_content_stream(&mut self, content_stream: &[u8]) -> Result<()> {
+        if self.has_emission_filter() {
+            let operators = parse_content_stream(content_stream)?;
+            for op in operators {
+                self.execute_operator(op)?;
+            }
+            Ok(())
+        } else {
+            parse_and_execute_text_only(content_stream, |op| self.execute_operator(op))
+        }
+    }
+
     /// Extract individual characters from a PDF content stream.
     ///
     /// This is a low-level method that extracts characters one by one.
@@ -3867,14 +3607,7 @@ impl<'doc> TextExtractor<'doc> {
         self.spans.clear(); // Ensure spans are clear so they don't poison xobject_spans_cache
         self.placed_pdf_keep = Self::placed_pdf_text_dominates(content_stream);
 
-        let operators = if self.excluded_inks.is_empty() {
-            parse_content_stream_text_only(content_stream)?
-        } else {
-            parse_content_stream(content_stream)?
-        };
-        for op in operators {
-            self.execute_operator(op)?;
-        }
+        self.run_content_stream(content_stream)?;
 
         // BUG FIX #2: Sort characters by reading order (top-to-bottom, left-to-right)
         // PDF content streams are in rendering order, not reading order.
@@ -4340,7 +4073,17 @@ impl<'doc> TextExtractor<'doc> {
         let mut prev_y_rounded: Option<i32> = None;
         let mut prev_x: Option<f32> = None;
         let mut prev_text: Option<String> = None;
-        let mut seen_content: std::collections::HashMap<String, (f32, f32)> =
+        // Every place a given string has been kept, not merely the last one.
+        //
+        // One slot per string cannot see an overprint. A page that draws each
+        // glyph twice — a grey pass and a black pass a fraction of a point
+        // apart, the usual way of faking a bold — yields single-glyph spans, so
+        // a title like `SICHERHEITS` stores `S` at its first position and then
+        // overwrites it with the `S` at the end of the same word. The second
+        // pass then compares its `S` against the wrong one and finds no
+        // duplicate.
+        const MAX_TRACKED_POSITIONS: usize = 32;
+        let mut seen_content: std::collections::HashMap<String, Vec<(f32, f32)>> =
             std::collections::HashMap::new();
 
         let mut geometric_skips = 0;
@@ -4367,22 +4110,36 @@ impl<'doc> TextExtractor<'doc> {
             };
 
             // PHASE 2: Content-based deduplication — require positions to OVERLAP
-            let content_duplicate = if span.text.len() >= 5 {
-                if let Some((prev_x_val, prev_y_val)) = seen_content.get(&span.text) {
-                    let y_diff = (span.bbox.y - prev_y_val).abs();
-                    let x_diff = (span.bbox.x - prev_x_val).abs();
-
-                    // Only dedup when spans overlap geometrically (X within 5pt)
-                    // NOT when they're at different positions on the same line
-                    let same_line = y_diff < 2.0;
-                    let overlapping_position = x_diff < 5.0;
-
-                    same_line && overlapping_position
+            //
+            // Short runs are included. They were excluded because a five-byte
+            // floor is a cheap stand-in for "this string is distinctive enough
+            // that repeating it at one position means a duplicate", but it also
+            // exempts every overprinted glyph, and PHASE 1 cannot cover them:
+            // it compares against the immediately preceding span only, and the
+            // sort that decides adjacency uses the same integer-rounded row key
+            // that the overprint's sub-point offset straddles, so the two
+            // copies are never neighbours — a page's whole grey pass is emitted
+            // before its black pass begins.
+            //
+            // What replaces the floor for a short run is a tighter bar on
+            // position: the same per-glyph advance PHASE 1 uses, so two
+            // legitimate repeats of one letter — the `ll` in `callibrator`, an
+            // `SS` — stand a full advance apart and are never confused with a
+            // pair that differs by a fraction of one.
+            let content_duplicate = {
+                let char_count = span.text.chars().count().max(1) as f32;
+                let per_glyph_width = (span.bbox.width / char_count).max(0.1);
+                let x_bar = if span.text.len() >= 5 {
+                    5.0
                 } else {
-                    false
-                }
-            } else {
-                false
+                    (per_glyph_width * Self::DEDUP_OVERLAP_RATIO).min(Self::DEDUP_OVERLAP_CAP_PT)
+                };
+                seen_content.get(&span.text).is_some_and(|seen| {
+                    seen.iter().any(|(prev_x_val, prev_y_val)| {
+                        (span.bbox.y - prev_y_val).abs() < 2.0
+                            && (span.bbox.x - prev_x_val).abs() < x_bar
+                    })
+                })
             };
 
             if geometric_duplicate {
@@ -4394,9 +4151,13 @@ impl<'doc> TextExtractor<'doc> {
                 prev_x = Some(x);
                 prev_text = Some(span.text.clone());
 
-                // Track content for duplicate detection
-                if span.text.len() >= 5 {
-                    seen_content.insert(span.text.clone(), (span.bbox.x, span.bbox.y));
+                // Track content for duplicate detection. Bounded, so a page
+                // repeating one string thousands of times cannot grow this
+                // without limit; the positions that matter for an overprint are
+                // the recent ones.
+                let at = seen_content.entry(span.text.clone()).or_default();
+                if at.len() < MAX_TRACKED_POSITIONS {
+                    at.push((span.bbox.x, span.bbox.y));
                 }
                 // Move span instead of cloning
                 deduplicated.push(span);
@@ -4734,9 +4495,15 @@ impl<'doc> TextExtractor<'doc> {
             //). Runs in a rotated frame never merge here; each
             // stays per-literal and the rotated-frame reading order and
             // word assembly handle them downstream.
-            let quadrant_vertical = |deg: f32| (deg - 90.0).abs() < 0.5 || (deg + 90.0).abs() < 0.5;
-            let rotation_compatible = !quadrant_vertical(current.rotation_degrees)
-                && !quadrant_vertical(span.rotation_degrees);
+            // "Never merge here" per the comment above means exactly that —
+            // any non-zero rotation on either side stays per-literal, not
+            // just the ±90° (vertical-quadrant) case. A 180°-rotated run
+            // previously slipped through this gate (only ±90° was checked),
+            // letting two upside-down lines' runs glue together under the
+            // portrait same-line test below even though 180° text advances
+            // in the opposite X direction.
+            let rotation_compatible =
+                current.rotation_degrees == 0.0 && span.rotation_degrees == 0.0;
             let y_diff = (span.bbox.y - current.bbox.y).abs();
             let same_line = y_diff < 1.0 && wmode_compatible && rotation_compatible;
 
@@ -4996,9 +4763,21 @@ impl<'doc> TextExtractor<'doc> {
                 );
                 current.text.push('.');
                 current.text.push_str(&span.text);
-            } else if cross_font_word_glue {
+            } else if cross_font_word_glue || small_caps_glue {
                 // Mid-word font/weight change: concatenate without any space
                 // or space-heuristic — these are same-word character runs.
+                //
+                // `small_caps_glue` belongs here for the same reason, and
+                // reaching the space heuristic instead is what put a space
+                // inside a small-capitals caption: it admitted the merge, then
+                // the heuristic it fell through to inserted a space anyway, so
+                // `TABLE 66.01-11(5)-COORDINATES OF CHROMATICITY` came out as
+                // `...-C OORDINATES...`. The predicate already establishes that
+                // the two runs share a font, a weight, a slant and a baseline
+                // and sit within a point of each other; ISO 32000-1:2008 §9.3.1
+                // makes the size a graphics-state parameter that may change
+                // between show operators, and nothing in §9.4 makes such a
+                // change a word boundary.
                 current.text.push_str(&span.text);
             } else if should_merge {
                 // PHASE 1 FIX: Check if next span is entirely whitespace-only OR marked as offset_semantic space
@@ -5564,24 +5343,80 @@ impl<'doc> TextExtractor<'doc> {
                 // scale-relative (0.5× the text-space glyph height, ≥0.5pt
                 // floor) so it is correct at any font size and still
                 // splits genuine line breaks.
+                //
+                // The `f`/`e` tests below only mean "same line" and "forward"
+                // while the run advances along +x; under a rotated matrix the
+                // two axes swap. The added conjunct re-checks both along the
+                // run's own writing axis (ISO 32000-1 §9.4.4).
                 let cur_font_size = self.state_stack.current().font_size;
+                // A run is contiguous glyphs, so the new origin must not skip
+                // an em of empty space past the run's own advance. `Td`, `TD`
+                // and `T*` all end the run outright; without a bound here `Tm`
+                // alone accepted an arbitrary forward jump, so two show
+                // operations positioned in different columns were glued into
+                // one span carrying no separator and a width spanning the void
+                // between them. ISO 32000-1:2008 §9.4.2, Table 108 gives `Tm`
+                // and `Td` the same effect on the text and text-line matrices,
+                // so a displacement that ends a run for one must end it for the
+                // other: continuity is a property of the resulting pen
+                // position, not of the operator that moved the pen.
+                //
+                // The bound is a column gap, not a word space. A producer can
+                // leave an intra-word repositioning seam WIDER than the same
+                // font's declared space advance, so no word-space constant
+                // separates a seam from a space; only the source-order
+                // evidence the span merger reads (a space glyph occupies a
+                // character position, a seam is pure repositioning) tells them
+                // apart. Everything narrower is therefore left to the merger,
+                // and this rule speaks only to gaps wide enough that the line
+                // grouping would already call them a column boundary — the
+                // same `max(3 x font size, 30 pt)` it uses, so the two levels
+                // cannot disagree about what separates text.
                 let is_continuation = self.merging_config.merge_tm_tj_runs
                     && match self.tj_span_buffer {
                         Some(ref mut buffer)
                             if !buffer.is_empty()
-                                && (f - buffer.start_matrix.f).abs()
-                                    <= ((cur_font_size * buffer.start_matrix.d).abs() * 0.5)
-                                        .max(0.5)
                                 && a == buffer.start_matrix.a
                                 && b == buffer.start_matrix.b
                                 && c == buffer.start_matrix.c
                                 && d == buffer.start_matrix.d
+                                // The raw-matrix band and forward test are kept
+                                // ANDed with the frame-correct rule rather than
+                                // replaced by it. Substituting reads better and
+                                // is what the writing-axis helper was built for,
+                                // but it changes what a quarter-turn run does:
+                                // the raw band collapses to its 0.5 pt floor
+                                // there, so rotated runs never merge today, and
+                                // letting them merge concatenates them in
+                                // content-stream order. That defeats the
+                                // writing-axis ordering the rotated line
+                                // grouping performs — a chart label drawing its
+                                // subscript last reads "H02" instead of "H2O".
+                                // Merging rotated runs is worth doing (a run set
+                                // glyph by glyph yields one span per glyph), but
+                                // only together with an ordering rule that
+                                // survives it, which is not this change.
+                                && (f - buffer.start_matrix.f).abs()
+                                    <= ((cur_font_size * buffer.start_matrix.d).abs() * 0.5)
+                                        .max(0.5)
                                 && e >= buffer.start_matrix.e =>
                         {
-                            // Same line, same transform, LTR progression →
-                            // update width to reflect actual visual extent
-                            buffer.accumulated_width = e - buffer.start_matrix.e;
-                            true
+                            match Self::run_continuation_along(
+                                buffer.start_matrix,
+                                buffer.wmode,
+                                e,
+                                f,
+                                cur_font_size,
+                                buffer.accumulated_width,
+                            ) {
+                                // Same line, same transform, forward along the
+                                // run → carry the visual extent forward.
+                                Some(along) => {
+                                    buffer.accumulated_width = along;
+                                    true
+                                },
+                                None => false,
+                            }
                         },
                         _ => false,
                     };
@@ -7189,6 +7024,10 @@ impl<'doc> TextExtractor<'doc> {
 
                 // Track span count for result caching
                 let spans_before = self.spans.len();
+                // Same mark for the character layer, so the §8.10.1 /BBox clip
+                // below can be applied to whichever layer this extraction is
+                // populating. Only one of the two grows per run.
+                let chars_before = self.chars.len();
 
                 // Save graphics state (implicit q per ISO 32000-1 §8.10.1)
                 self.state_stack.save();
@@ -7212,20 +7051,7 @@ impl<'doc> TextExtractor<'doc> {
                     .push(crate::structure::McidScope::Form(xobject_ref));
 
                 self.xobject_depth += 1;
-                let parse_result = if self.excluded_inks.is_empty() {
-                    parse_and_execute_text_only(&stream_data, |op| self.execute_operator(op))
-                } else {
-                    let ops = parse_content_stream(&stream_data);
-                    match ops {
-                        Ok(ops) => {
-                            for op in ops {
-                                self.execute_operator(op)?;
-                            }
-                            Ok(())
-                        },
-                        Err(e) => Err(e),
-                    }
-                };
+                let parse_result = self.run_content_stream(&stream_data);
                 self.xobject_depth -= 1;
                 // Pop the Form XObject scope pushed before the
                 // content-stream walk. Cleared regardless of parse
@@ -7252,7 +7078,9 @@ impl<'doc> TextExtractor<'doc> {
                 // on every form whose painted text lies inside its BBox (the
                 // conformant majority) — only out-of-BBox marks are dropped.
                 if let Some([bx0, by0, bx1, by1]) = form_bbox {
-                    if self.spans.len() > spans_before && bx1 > bx0 && by1 > by0 {
+                    let painted_anything =
+                        self.spans.len() > spans_before || self.chars.len() > chars_before;
+                    if painted_anything && bx1 > bx0 && by1 > by0 {
                         // Map the BBox corners through the form CTM into page space
                         // and take the axis-aligned bound (a superset for rotated
                         // forms — conservative, never over-clips).
@@ -7275,14 +7103,16 @@ impl<'doc> TextExtractor<'doc> {
                             // are kept (conformant clipping is exact; this only
                             // guards float rounding, far below any real margin).
                             const TOL: f32 = 1.0;
-                            let inside = |s: &TextSpan| {
-                                let cx = s.bbox.x + s.bbox.width * 0.5;
-                                let cy = s.bbox.y + s.bbox.height * 0.5;
+                            let inside_bbox = |b: &crate::geometry::Rect| {
+                                let cx = b.x + b.width * 0.5;
+                                let cy = b.y + b.height * 0.5;
                                 cx >= min_x - TOL
                                     && cx <= max_x + TOL
                                     && cy >= min_y - TOL
                                     && cy <= max_y + TOL
                             };
+                            let inside = |s: &TextSpan| inside_bbox(&s.bbox);
+                            let inside_char = |c: &TextChar| inside_bbox(&c.bbox);
                             // Fast path: when every span this form painted is
                             // already inside its /BBox (the conformant majority —
                             // and where this clip is a no-op anyway), skip the
@@ -7290,7 +7120,10 @@ impl<'doc> TextExtractor<'doc> {
                             // rare out-of-BBox case (the draft-galley underlay)
                             // pays for the rebuild. Cheap O(form-spans) scan, no
                             // allocation; keeps large form-heavy docs fast.
-                            if self.spans[spans_before..].iter().any(|s| !inside(s)) {
+                            let spans_stray = self.spans[spans_before..].iter().any(|s| !inside(s));
+                            let chars_stray =
+                                self.chars[chars_before..].iter().any(|c| !inside_char(c));
+                            if spans_stray || chars_stray {
                                 // Out-of-BBox spans exist. Distinguish a real
                                 // figure form (whose stray out-of-BBox text is a
                                 // draft-galley underlay safe to drop) from a
@@ -7319,10 +7152,18 @@ impl<'doc> TextExtractor<'doc> {
                                 let is_page_wrapper =
                                     page_area.is_some_and(|pa| clip_area >= 0.6 * pa);
                                 if !is_page_wrapper {
-                                    let added = self.spans.split_off(spans_before);
-                                    let kept: Vec<TextSpan> =
-                                        added.into_iter().filter(|s| inside(s)).collect();
-                                    self.spans.extend(kept);
+                                    if spans_stray {
+                                        let added = self.spans.split_off(spans_before);
+                                        let kept: Vec<TextSpan> =
+                                            added.into_iter().filter(|s| inside(s)).collect();
+                                        self.spans.extend(kept);
+                                    }
+                                    if chars_stray {
+                                        let added = self.chars.split_off(chars_before);
+                                        let kept: Vec<TextChar> =
+                                            added.into_iter().filter(inside_char).collect();
+                                        self.chars.extend(kept);
+                                    }
                                 }
                             }
                         }
@@ -7516,6 +7357,8 @@ impl<'doc> TextExtractor<'doc> {
             wmode: buffer.wmode,
             text_rise: buffer.text_rise,
             rtl_draw_logical: false,
+            mirrored: buffer.mirrored,
+            page_rotation_applied: 0,
         };
         self.span_sequence_counter += 1;
 
@@ -8048,6 +7891,8 @@ impl<'doc> TextExtractor<'doc> {
                 0.0
             },
             rtl_draw_logical: false,
+            mirrored: run_is_mirrored(&state.ctm.multiply(&state.text_matrix)),
+            page_rotation_applied: 0,
         };
 
         // Step 6: Increment sequence counter and add to spans
@@ -8392,7 +8237,22 @@ impl<'doc> TextExtractor<'doc> {
                     }
                     w_sum += w;
                     // Track per-character advance widths
-                    let chars_added = buffer.unicode.len() - len_before;
+                    // Count the characters this code produced, not the bytes.
+                    // `unicode` is a `String`, so its `len()` is a byte count:
+                    // one em dash is three bytes and used to push three widths
+                    // for one character, leaving `char_widths` two entries
+                    // ahead of the text for the rest of the run. Every glyph
+                    // after it then carried a neighbour's advance — on one
+                    // regulatory caption the closing `C` of `66.01–11(5)—C`
+                    // was given 2.664 pt, a bracket's width, where its own is
+                    // 5.776 pt, so the span ended 3.648 pt short of its ink and
+                    // a gap appeared where the page has none.
+                    //
+                    // ISO 32000-1:2008 §9.4.4 gives each glyph one displacement
+                    // along the writing axis, so this array carries one entry
+                    // per character and must be indexed the same way the text
+                    // is.
+                    let chars_added = buffer.unicode[len_before..].chars().count();
                     if chars_added == 1 {
                         buffer.char_widths.push(w);
                     } else if chars_added > 1 {
@@ -8408,11 +8268,13 @@ impl<'doc> TextExtractor<'doc> {
                 // 2-byte codes per ToUnicode codespace.
                 buffer.append(text)?;
                 let mut w_sum = 0.0f32;
-                for (char_code, _) in TextCharIter::new(text, Some(font)) {
+                for (char_code, nbytes) in TextCharIter::new(text, Some(font)) {
                     let mut w = font.get_glyph_width(char_code) * fs_factor * hs_factor;
                     w += cs_hs;
-                    // Standard PDF space character (code 32) triggers word spacing
-                    if char_code == 32 {
+                    // Per ISO 32000-1:2008 §9.3.3: Tw applies only to the
+                    // single-byte character code 32 — a 2-byte CID 32 inside
+                    // an Identity-H/CJK font must not take Tw.
+                    if nbytes == 1 && char_code == 32 {
                         w += ws_hs;
                     }
                     w_sum += w;
@@ -8428,11 +8290,13 @@ impl<'doc> TextExtractor<'doc> {
                 // axis per §9.3.4).
                 buffer.append(text)?;
                 let mut w_sum = 0.0f32;
-                for (char_code, _) in TextCharIter::new(text, Some(font)) {
+                for (char_code, nbytes) in TextCharIter::new(text, Some(font)) {
                     let w1y = font.get_vertical_metrics(char_code).w1y;
                     let mut w = w1y * fs_factor;
                     w += char_space;
-                    if char_code == 32 {
+                    // Per ISO 32000-1:2008 §9.3.3: Tw applies only to the
+                    // single-byte character code 32.
+                    if nbytes == 1 && char_code == 32 {
                         w += word_space;
                     }
                     w_sum += w;
@@ -8593,7 +8457,22 @@ impl<'doc> TextExtractor<'doc> {
                         w += ws_hs;
                     }
                     w_sum += w;
-                    let chars_added = buffer.unicode.len() - len_before;
+                    // Count the characters this code produced, not the bytes.
+                    // `unicode` is a `String`, so its `len()` is a byte count:
+                    // one em dash is three bytes and used to push three widths
+                    // for one character, leaving `char_widths` two entries
+                    // ahead of the text for the rest of the run. Every glyph
+                    // after it then carried a neighbour's advance — on one
+                    // regulatory caption the closing `C` of `66.01–11(5)—C`
+                    // was given 2.664 pt, a bracket's width, where its own is
+                    // 5.776 pt, so the span ended 3.648 pt short of its ink and
+                    // a gap appeared where the page has none.
+                    //
+                    // ISO 32000-1:2008 §9.4.4 gives each glyph one displacement
+                    // along the writing axis, so this array carries one entry
+                    // per character and must be indexed the same way the text
+                    // is.
+                    let chars_added = buffer.unicode[len_before..].chars().count();
                     if chars_added == 1 {
                         buffer.char_widths.push(w);
                     } else if chars_added > 1 {
@@ -8774,6 +8653,8 @@ impl<'doc> TextExtractor<'doc> {
                 0.0
             },
             rtl_draw_logical: false,
+            mirrored: run_is_mirrored(&state.ctm.multiply(&state.text_matrix)),
+            page_rotation_applied: 0,
         };
         self.span_sequence_counter += 1;
 
@@ -8842,6 +8723,84 @@ impl<'doc> TextExtractor<'doc> {
         };
         *last += adv;
         buffer.accumulated_width += adv;
+    }
+
+    /// Whether `(e, f)` continues `start`'s run along that run's writing axis.
+    ///
+    /// ISO 32000-1:2008 §9.4.4 places the writing direction along the matrix's
+    /// `(a, b)` row, so the displacement resolves into a component along it
+    /// (the advance) and one perpendicular (the line offset). For any `b = 0,
+    /// a > 0` matrix the along test equals the caller's raw `e` test and the
+    /// perpendicular test is implied by the raw `f` band (`hypot(c, d) >=
+    /// |d|`, equal only when unskewed), so ANDing it in cannot change upright
+    /// output.
+    ///
+    /// WMode 1 is exempt: vertical text advances along `(c, d)` instead, the
+    /// branch [`GraphicsState::advance_text_matrix`] already makes, and reading
+    /// its advance as a perpendicular offset splits a column glyph by glyph.
+    /// The run's new accumulated width when `(e, f)` continues the run that
+    /// started at `start`, or `None` when it ends the run.
+    ///
+    /// One frame-correct test in place of three raw-matrix ones. `e` and `f`
+    /// are the text matrix's translation components, so comparing them
+    /// directly assumes the run advances along `+x` and separates along `y` —
+    /// true only for an upright matrix. Under a quarter turn the two axes are
+    /// exchanged, and per ISO 32000-1:2008 §9.4.4 the glyph displacement lies
+    /// along the text matrix's `(a, b)` row whichever way it points. Projecting
+    /// the displacement onto that row and its perpendicular asks the same three
+    /// questions in the run's own frame:
+    ///
+    /// * is the new origin on the run's line (perpendicular within tolerance),
+    /// * does it lie forward along the run rather than behind it,
+    /// * and is it close enough to the run's end to be the next glyph?
+    ///
+    /// The raw-matrix form got the right answer for upright text and, for a
+    /// quarter turn, an accidental one: the perpendicular tolerance collapsed
+    /// to its 0.5 pt floor, so consecutive glyphs of a rotated run each became
+    /// their own span. Ten glyphs that batch into one span upright produced ten
+    /// spans rotated.
+    ///
+    /// Vertical writing mode keeps the raw comparison. §9.7.4.3 gives it a
+    /// different axis convention, which the `(a, b)` row does not describe.
+    fn run_continuation_along(
+        start: Matrix,
+        wmode: u8,
+        e: f32,
+        f: f32,
+        font_size: f32,
+        accumulated: f32,
+    ) -> Option<f32> {
+        if wmode != 0 {
+            let on_line = (f - start.f).abs() <= ((font_size * start.d).abs() * 0.5).max(0.5);
+            return (on_line && e >= start.e).then_some(e - start.e);
+        }
+        // Unit vector along the writing direction. A degenerate (zero-scale)
+        // matrix has no direction to speak of; fall back to +x so such runs
+        // behave exactly as they did before this test existed.
+        let axis = (start.a * start.a + start.b * start.b).sqrt();
+        let (ux, uy) = if axis > 0.0 {
+            (start.a / axis, start.b / axis)
+        } else {
+            (1.0, 0.0)
+        };
+        let (dx, dy) = (e - start.e, f - start.f);
+        let along = ux * dx + uy * dy;
+        let perp = -uy * dx + ux * dy;
+        // Perpendicular scale; `hypot(c, d) >= |d|`, so an upright (`b == 0`)
+        // run keeps at least the raw `f` band.
+        let line_scale = (start.c * start.c + start.d * start.d).sqrt();
+        let tolerance = ((font_size * line_scale).abs() * 0.5).max(0.5);
+        if perp.abs() > tolerance || along < 0.0 {
+            return None;
+        }
+        // The run is contiguous glyphs, so the new origin must not skip a
+        // separating gap past the run's own advance. `max(3 x font size,
+        // 30 pt)` is the column-gap threshold the line grouping already uses
+        // to decide that two pieces of text belong to different columns; a
+        // displacement that wide is the same judgement made one level earlier,
+        // so the two agree by construction rather than by coincidence.
+        let limit = ((font_size * 3.0).max(30.0) * axis.max(1e-6)).abs();
+        (along - accumulated <= limit).then_some(along)
     }
 
     /// Flush accumulated Tj span buffer into a single TextSpan.
@@ -8951,6 +8910,8 @@ impl<'doc> TextExtractor<'doc> {
                     wmode: buffer.wmode,
                     text_rise: buffer.text_rise,
                     rtl_draw_logical: false,
+                    mirrored: buffer.mirrored,
+                    page_rotation_applied: 0,
                 };
                 self.span_sequence_counter += 1;
 
@@ -8997,7 +8958,7 @@ impl<'doc> TextExtractor<'doc> {
         // Get current font from cached reference
         let font = self.cached_current_font.as_deref();
 
-        for (char_code, _) in TextCharIter::new(text, font) {
+        for (char_code, nbytes) in TextCharIter::new(text, font) {
             // Get current text matrix (may be updated by previous characters in this string)
             let state = self.state_stack.current();
             let text_matrix = state.text_matrix;
@@ -9043,10 +9004,14 @@ impl<'doc> TextExtractor<'doc> {
             //   vertical:   ty = w1y * Tfs + Tc + Tw    (NO Th — Tz is a
             //               glyph-stretching factor on the X axis only;
             //               see §9.3.4).
+            // Word spacing applies only to the SINGLE-BYTE code 32
+            // (ISO 32000-1 §9.3.3), never to a multi-byte code whose value
+            // happens to be 32.
+            let ws_applies = char_code == 32 && nbytes == 1;
             let mut tx = if wmode == 0 {
                 glyph_width_user_space
                     + char_space * hs_factor
-                    + if char_code == 32 {
+                    + if ws_applies {
                         word_space * hs_factor
                     } else {
                         0.0
@@ -9055,7 +9020,7 @@ impl<'doc> TextExtractor<'doc> {
                 let w1y = font
                     .map(|f| f.get_vertical_metrics(char_code).w1y)
                     .unwrap_or(crate::fonts::VerticalMetrics::SPEC_DEFAULT.w1y);
-                w1y * fs_factor + char_space + if char_code == 32 { word_space } else { 0.0 }
+                w1y * fs_factor + char_space + if ws_applies { word_space } else { 0.0 }
             };
 
             // For TextChar, we use the device-space width
@@ -9314,6 +9279,133 @@ mod tests {
         );
     }
 
+    /// The writing-axis continuation test, quadrant by quadrant.
+    ///
+    /// This is now the whole continuation rule rather than one veto ANDed onto
+    /// a raw-matrix pair, so each quadrant pins all three of its questions: on
+    /// the line, forward along it, and near enough to the run's end to be the
+    /// next glyph.
+    #[test]
+    fn test_run_continuation_by_quadrant() {
+        let m = |a, b, c, d| Matrix {
+            a,
+            b,
+            c,
+            d,
+            e: 100.0,
+            f: 500.0,
+        };
+        let fs = 10.0;
+        // A run that has already advanced 14 pt, so a 14 pt displacement puts
+        // the new origin exactly at its end — the contiguous case.
+        let at = |mat: Matrix, de: f32, df: f32| {
+            TextExtractor::run_continuation_along(mat, 0, mat.e + de, mat.f + df, fs, 14.0)
+                .is_some()
+        };
+
+        // Upright: the frame the raw `e`/`f` comparison was already right for.
+        let upright = m(1.0, 0.0, 0.0, 1.0);
+        assert!(at(upright, 14.0, 0.0), "upright advance must continue");
+        assert!(!at(upright, 0.0, -14.0), "upright line break must not");
+        assert!(!at(upright, -14.0, 0.0), "upright backwards must not");
+        // Perpendicular tolerance: 0.5 × font size (5pt here) admits a
+        // sub-glyph baseline offset; a full line step is vetoed.
+        assert!(at(upright, 14.0, 4.0), "upright sub-glyph offset must not be vetoed");
+        assert!(!at(upright, 14.0, 8.0), "upright line step must be vetoed");
+
+        // Advances along +y; lines separate along +x.
+        let cw = m(0.0, 1.0, -1.0, 0.0);
+        assert!(at(cw, 0.0, 14.0), "90° along-axis advance must continue");
+        assert!(!at(cw, 14.0, 0.0), "90° line break must not");
+        assert!(at(cw, -4.0, 14.0), "90° sub-glyph offset must not be vetoed");
+        assert!(!at(cw, -8.0, 14.0), "90° line step must be vetoed");
+
+        // Advances along -y; the sign a single-rotation fixture cannot catch.
+        let ccw = m(0.0, -1.0, 1.0, 0.0);
+        assert!(at(ccw, 0.0, -14.0), "270° along-axis advance must continue");
+        assert!(!at(ccw, 0.0, 14.0), "270° backwards advance must not");
+        assert!(!at(ccw, 14.0, 0.0), "270° line break must not");
+
+        // 180°: advances along -x.
+        let flip = m(-1.0, 0.0, 0.0, -1.0);
+        assert!(at(flip, -14.0, 0.0), "180° along-axis advance must continue");
+        assert!(!at(flip, 14.0, 0.0), "180° backwards advance must not");
+
+        // No writing direction: falls back to +x, as before.
+        let degenerate = m(0.0, 0.0, 0.0, 0.0);
+        assert!(at(degenerate, 14.0, 0.0));
+        assert!(!at(degenerate, -14.0, 0.0));
+    }
+
+    /// The gap bound, in every quadrant. A jump past the run's end by more
+    /// than a column gap is a new run wherever the run happens to point — the
+    /// rule that keeps two columns of rotated text from gluing into one span.
+    ///
+    /// The threshold is `max(3 x font size, 30 pt)`, the same one the line
+    /// grouping uses to separate columns, so the two levels agree about what
+    /// counts as a separating gap.
+    #[test]
+    fn test_run_continuation_bounds_the_gap_in_every_quadrant() {
+        let m = |a, b, c, d| Matrix {
+            a,
+            b,
+            c,
+            d,
+            e: 100.0,
+            f: 500.0,
+        };
+        let fs = 10.0;
+        // The run has advanced 14 pt and the threshold at 10 pt type is
+        // max(30, 30) = 30 pt, so a displacement of 44 lands exactly at the
+        // bound and 60 is well beyond it.
+        let at = |mat: Matrix, de: f32, df: f32| {
+            TextExtractor::run_continuation_along(mat, 0, mat.e + de, mat.f + df, fs, 14.0)
+                .is_some()
+        };
+        for (name, mat, unit) in [
+            ("upright", m(1.0, 0.0, 0.0, 1.0), (1.0f32, 0.0f32)),
+            ("90°", m(0.0, 1.0, -1.0, 0.0), (0.0, 1.0)),
+            ("270°", m(0.0, -1.0, 1.0, 0.0), (0.0, -1.0)),
+            ("180°", m(-1.0, 0.0, 0.0, -1.0), (-1.0, 0.0)),
+        ] {
+            let step = |d: f32| (unit.0 * d, unit.1 * d);
+            let (e44, f44) = step(44.0);
+            assert!(at(mat, e44, f44), "{name}: a gap of exactly the threshold must continue");
+            let (e60, f60) = step(60.0);
+            assert!(!at(mat, e60, f60), "{name}: a gap beyond the threshold must end the run");
+        }
+    }
+
+    /// Vertical writing mode keeps the raw comparison: §9.7.4.3 gives it an
+    /// axis convention the `(a, b)` row does not describe, so it is out of
+    /// this rule's scope and must behave exactly as before.
+    #[test]
+    fn test_run_continuation_leaves_vertical_writing_mode_alone() {
+        let upright = Matrix {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 100.0,
+            f: 500.0,
+        };
+        let fs = 10.0;
+        // The raw test: same `f`, forward `e`.
+        assert_eq!(
+            TextExtractor::run_continuation_along(upright, 1, 140.0, 500.0, fs, 0.0),
+            Some(40.0),
+            "a forward step on the same baseline continues, and reports its offset"
+        );
+        assert!(
+            TextExtractor::run_continuation_along(upright, 1, 60.0, 500.0, fs, 0.0).is_none(),
+            "a backwards step ends the run"
+        );
+        assert!(
+            TextExtractor::run_continuation_along(upright, 1, 140.0, 460.0, fs, 0.0).is_none(),
+            "a line step ends the run"
+        );
+    }
+
     #[test]
     fn test_snap_run_rotation() {
         let m = |a, b, c, d| Matrix {
@@ -9332,6 +9424,12 @@ mod tests {
         assert_eq!(snap_run_rotation(&m(0.0, 12.0, -12.0, 0.0)), 90.0);
         // 270° / -90° (a=0, b=-s, c=+s, d=0).
         assert_eq!(snap_run_rotation(&m(0.0, -12.0, 12.0, 0.0)), -90.0);
+        // 180° (a=-s, d=-s, b=c=0) must not alias to 0° — both have
+        // b≈0, c≈0, so only the sign of `a` (cos 0° vs cos 180°)
+        // distinguishes them.
+        assert_eq!(snap_run_rotation(&m(-12.0, 0.0, 0.0, -12.0)), 180.0);
+        // Tiny float noise on a 180° matrix still counts as 180°, not 0°.
+        assert_eq!(snap_run_rotation(&m(-12.0, 1e-5, -1e-5, -12.0)), 180.0);
         // ~88° snaps to 90.
         let r = 12.0_f32;
         let th = 88.0_f32.to_radians();
@@ -9372,6 +9470,7 @@ mod tests {
             cid_default_width: 1000.0,
             has_explicit_dw: false,
             cff_gid_map: None,
+            cff_cid_to_gid: None,
             multi_char_map: HashMap::new(),
             byte_to_char_table: std::sync::OnceLock::new(),
             type0_unicode_memo: std::sync::Arc::new(std::sync::Mutex::new(
@@ -9467,6 +9566,52 @@ mod tests {
             "Y position should be ~200 (got {})",
             chars[0].bbox.y
         );
+    }
+
+    /// Regression test for issue #1006: char mode must run the same parser as
+    /// span mode.
+    ///
+    /// The stream forces the streaming parser's >256KB prescan route: the
+    /// rotating `q`/`cm` sits >4KB before `BT`, so the CTM reaches the text
+    /// region only via the forward scan's injected `Cm`. The unbalanced
+    /// literal-string opens are invisible to the prescan (they lie outside
+    /// every text region) but feed the old char-mode parser,
+    /// `parse_content_stream_text_only`, over `MAX_CONSECUTIVE_ERRORS`
+    /// consecutive scan failures — it bails before `BT` and extracts nothing.
+    #[test]
+    fn test_char_mode_rotated_ctm_survives_large_hostile_stream() {
+        let mut extractor = TextExtractor::new();
+        let font = create_test_font();
+        extractor.add_font("F1".to_string(), font);
+
+        let mut cs = Vec::new();
+        cs.extend_from_slice(b"q\n0 1 -1 0 612 0 cm\n");
+        cs.extend_from_slice(&[b'('; 1500]);
+        cs.push(b'\n');
+        for i in 0..13000u32 {
+            let line = format!(
+                "{}.0 {}.0 m {}.0 {}.0 l S\n",
+                i % 500,
+                (i * 7) % 500,
+                (i * 3) % 500,
+                (i * 11) % 500
+            );
+            cs.extend_from_slice(line.as_bytes());
+        }
+        assert!(cs.len() > 256 * 1024, "stream must exceed the 256KB prescan threshold");
+        cs.extend_from_slice(b"BT /F1 12 Tf 100 200 Td (Hello) Tj ET\nQ\n");
+
+        let chars = extractor.extract(&cs).unwrap();
+        let mut glyphs: Vec<char> = chars.iter().map(|c| c.char).collect();
+        glyphs.sort_unstable();
+        assert_eq!(glyphs, vec!['H', 'e', 'l', 'l', 'o']);
+        for c in &chars {
+            assert!(
+                (c.rotation_degrees - 90.0).abs() < 1.0,
+                "expected 90 degrees from the cm before BT, got {}",
+                c.rotation_degrees
+            );
+        }
     }
 
     /// Regression test for Issue #11: CTM scaling must affect text positions
@@ -9755,6 +9900,108 @@ mod tests {
         );
     }
 
+    /// Regression test for issue #1033: a `/PlacedPDF` marked-content scope
+    /// whose `BDC` lands inside the first prescanned (>256KB fast-path)
+    /// text region but whose matching `EMC` falls outside it — past tens
+    /// of thousands of bytes of artwork the prescan never turns into a
+    /// text region — must not suppress text in every subsequent region.
+    /// Before the fix, `inside_placed_pdf` stayed `true` forever once the
+    /// scope's `EMC` fell outside a prescanned region's byte range, since
+    /// the marked-content stack (unlike CTM/font) got no
+    /// per-region balancing.
+    #[test]
+    fn test_prescan_marked_content_scope_does_not_leak_across_regions() {
+        let mut cs = Vec::new();
+        cs.extend_from_slice(b"/PlacedPDF /MC0 BDC\n");
+        cs.extend_from_slice(b"BT /F1 12 Tf 100 700 Td (Figure Label) Tj ET\n");
+        // >256KB of filler path data (the artwork) with no BT/Do at all,
+        // so the prescan never turns it into its own text region — the
+        // EMC below lands in the gap between the two BT regions.
+        for i in 0..13000u32 {
+            let line = format!(
+                "{}.0 {}.0 m {}.0 {}.0 l n\n",
+                i % 500,
+                (i * 7) % 500,
+                (i * 3) % 500,
+                (i * 11) % 500
+            );
+            cs.extend_from_slice(line.as_bytes());
+        }
+        cs.extend_from_slice(b"EMC\n");
+        cs.extend_from_slice(b"BT /F1 12 Tf 100 600 Td (Body Text After Figure) Tj ET\n");
+        assert!(cs.len() > 256 * 1024, "stream must exceed 256KB prescan threshold");
+
+        let font = create_test_font();
+        let mut extractor = TextExtractor::new();
+        extractor.add_font("F1".to_string(), font);
+
+        let spans = extractor.extract_text_spans(&cs).unwrap();
+        let all_text: String = spans
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            !all_text.contains("Figure Label"),
+            "text inside the /PlacedPDF scope must still be suppressed, got: {all_text:?}"
+        );
+        assert!(
+            all_text.contains("Body Text After Figure"),
+            "text after the /PlacedPDF scope closes (EMC) must not be suppressed \
+             just because the EMC fell outside the prescanned region, got: {all_text:?}"
+        );
+    }
+
+    /// Regression test for issue #1024: invisible text (Tr 3/7) must never
+    /// be classified monospace, even under a FixedPitch-flagged or
+    /// "GlyphLessFont"-named font. Such text is an OCR text-sandwich layer
+    /// sitting under a scanned page image — a synthetic OCR font commonly
+    /// sets FixedPitch purely for positioning simplicity, since the glyphs
+    /// are never rendered. Markdown conversion uses `is_monospace` to fence
+    /// a paragraph as a code block; without this gate, a scanned novel's
+    /// OCR'd dialogue trips FixedPitch and gets served as a code block.
+    #[test]
+    fn test_invisible_text_is_never_monospace() {
+        // Invisible render mode (Tr 3) + FixedPitch-flagged font: must NOT
+        // be monospace despite the flag.
+        let mut ocr_font = create_test_font();
+        ocr_font.base_font = "GlyphLessFont".to_string();
+        ocr_font.flags = Some(1); // bit 0 = FixedPitch
+
+        let mut extractor = TextExtractor::new();
+        extractor.add_font("F1".to_string(), ocr_font);
+
+        let stream = b"BT /F1 12 Tf 3 Tr 100 700 Td (\"I don't know,\" she said.) Tj ET";
+        let spans = extractor.extract_text_spans(stream).unwrap();
+
+        assert!(!spans.is_empty(), "should produce at least one span");
+        assert!(
+            !spans[0].is_monospace,
+            "invisible (Tr 3) text under a FixedPitch OCR font must not be \
+             classified monospace"
+        );
+
+        // Control: the SAME FixedPitch font, but VISIBLE (default Tr 0),
+        // must still be classified monospace — the gate must not
+        // over-suppress real code/monospace content.
+        let mut visible_font = create_test_font();
+        visible_font.base_font = "Courier".to_string();
+        visible_font.flags = Some(1);
+
+        let mut extractor2 = TextExtractor::new();
+        extractor2.add_font("F2".to_string(), visible_font);
+
+        let stream2 = b"BT /F2 12 Tf 100 700 Td (let x = 1;) Tj ET";
+        let spans2 = extractor2.extract_text_spans(stream2).unwrap();
+
+        assert!(!spans2.is_empty(), "should produce at least one span");
+        assert!(
+            spans2[0].is_monospace,
+            "visible FixedPitch text must still be classified monospace"
+        );
+    }
+
     #[test]
     fn test_extract_save_restore() {
         let mut extractor = TextExtractor::new();
@@ -9910,6 +10157,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -9943,6 +10192,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -10831,6 +11082,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }
     }
 
@@ -11844,6 +12097,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -11872,6 +12127,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -11925,6 +12182,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             };
 
         // (glyph, Helvetica per-em advance width)
@@ -11986,6 +12245,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         };
 
         // Stroke pass + fill pass at ~2 % of advance apart.
@@ -12043,6 +12304,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             });
         }
 
@@ -12242,6 +12505,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -12270,6 +12535,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -12277,6 +12544,92 @@ mod tests {
         assert_eq!(extractor.spans.len(), 1, "Adjacent spans on same line should merge");
         assert!(extractor.spans[0].text.contains("Hello"));
         assert!(extractor.spans[0].text.contains("World"));
+    }
+
+    #[test]
+    fn test_merge_adjacent_spans_180_degree_runs_never_merge() {
+        // Same shared-baseline-Y, small-gap shape as
+        // `test_merge_adjacent_spans_same_line`, but both runs are
+        // 180°-rotated (upside-down text). The rotation-compatibility gate
+        // previously only rejected ±90° (vertical-quadrant) runs, so a
+        // 180°/180° pair slipped through and merged under the portrait
+        // same-line test even though 180° text advances in the opposite X
+        // direction — exactly the hazard `snap_run_rotation`'s 180°-aliasing
+        // bug (fixed alongside this) would otherwise mask, since before
+        // that fix a 180° matrix was misreported as 0.0 in the first place.
+        let mut extractor = TextExtractor::new();
+        extractor.merging_config = SpanMergingConfig::legacy();
+
+        extractor.spans = vec![
+            TextSpan {
+                provenance: None,
+                text_rise: 0.0,
+                mirrored: false,
+                page_rotation_applied: 0,
+                artifact_type: None,
+                text: "Hello".to_string(),
+                bbox: Rect::new(100.0, 700.0, 30.0, 12.0),
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                mcid_scope: None,
+                sequence: 0,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+                char_x_offsets: Vec::new(),
+                heading_level: None,
+                rotation_degrees: 180.0,
+                wmode: 0,
+                rtl_draw_logical: false,
+            },
+            TextSpan {
+                provenance: None,
+                text_rise: 0.0,
+                mirrored: false,
+                page_rotation_applied: 0,
+                artifact_type: None,
+                text: "World".to_string(),
+                bbox: Rect::new(131.0, 700.0, 30.0, 12.0), // 1pt gap
+                font_name: "F1".to_string(),
+                font_size: 12.0,
+                font_weight: FontWeight::Normal,
+                color: Color::black(),
+                mcid: None,
+                mcid_scope: None,
+                sequence: 1,
+                split_boundary_before: false,
+                offset_semantic: false,
+                is_italic: false,
+                is_monospace: false,
+                char_spacing: 0.0,
+                word_spacing: 0.0,
+                horizontal_scaling: 100.0,
+                primary_detected: false,
+                char_widths: vec![],
+                char_x_offsets: Vec::new(),
+                heading_level: None,
+                rotation_degrees: 180.0,
+                wmode: 0,
+                rtl_draw_logical: false,
+            },
+        ];
+
+        extractor.merge_adjacent_spans();
+        assert_eq!(
+            extractor.spans.len(),
+            2,
+            "180°-rotated runs must never merge here, even on a shared baseline-Y \
+             with a small gap"
+        );
     }
 
     #[test]
@@ -12312,6 +12665,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -12340,6 +12695,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -12387,6 +12744,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -12415,6 +12774,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -12455,6 +12816,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -12483,6 +12846,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -12511,6 +12876,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -14945,6 +15312,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -14973,6 +15342,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -15011,6 +15382,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -15039,6 +15412,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -15137,6 +15512,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }];
 
         extractor.split_fused_words();
@@ -15176,6 +15553,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }];
 
         extractor.split_fused_words();
@@ -15362,6 +15741,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -15390,6 +15771,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -15474,6 +15857,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -15502,6 +15887,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -15806,6 +16193,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -15834,6 +16223,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16044,6 +16435,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16072,6 +16465,8 @@ mod tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16617,6 +17012,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16645,6 +17042,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16692,6 +17091,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16720,6 +17121,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16767,6 +17170,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16795,6 +17200,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16848,6 +17255,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16876,6 +17285,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16921,6 +17332,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -16949,6 +17362,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -16991,6 +17406,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -17019,6 +17436,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -17065,6 +17484,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -17093,6 +17514,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -17134,6 +17557,8 @@ mod profile_based_space_tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }
     }
 
@@ -17266,6 +17691,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -17294,6 +17721,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 
@@ -17349,6 +17778,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
             TextSpan {
                 provenance: None,
@@ -17377,6 +17808,8 @@ mod profile_based_space_tests {
                 rotation_degrees: 0.0,
                 wmode: 0,
                 rtl_draw_logical: false,
+                mirrored: false,
+                page_rotation_applied: 0,
             },
         ];
 

@@ -1440,6 +1440,16 @@ static NSArray<POXSearchResult*>* POXTakeSearchResults(FfiSearchResults* list) {
     return POXTakeString(pdf_document_classify_document(_handle, &code), code,
                          @"classifyDocument", error);
 }
+- (NSString*)structuredWarningsWithError:(NSError**)error {
+    int32_t code = 0;
+    return POXTakeString(pdf_document_structured_warnings(_handle, &code), code,
+                         @"structuredWarnings", error);
+}
+- (NSString*)takeStructuredWarningsWithError:(NSError**)error {
+    int32_t code = 0;
+    return POXTakeString(pdf_document_take_structured_warnings(_handle, &code), code,
+                         @"takeStructuredWarnings", error);
+}
 
 // ── Header / footer / artifact removal ───────────────────────────────────────
 
@@ -4532,6 +4542,16 @@ static void POXBuildByteArrays(NSArray<NSData*>* blobs, const uint8_t*** ptrs,
     pdf_oxide_element_get_rect(_handle, index, &x, &y, &w, &h, &code);
     if (code != 0 && error)
         *error = POXMakeError(code, @"elementRect");
+    POXBbox box = {x, y, w, h};
+    return box;
+}
+
+- (POXBbox)pageRectAtIndex:(int32_t)index error:(NSError**)error {
+    int32_t code = 0;
+    float x = 0, y = 0, w = 0, h = 0;
+    pdf_oxide_element_get_page_rect(_handle, index, &x, &y, &w, &h, &code);
+    if (code != 0 && error)
+        *error = POXMakeError(code, @"elementPageRect");
     POXBbox box = {x, y, w, h};
     return box;
 }
