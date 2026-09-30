@@ -2662,8 +2662,10 @@ pdf_page_get_rotation <- function(doc, page) {
 #'
 #' @param doc A `pdfoxide_document`.
 #' @param page 0-based page index.
-#' @return A list of `Element` records, each `list(type=, text=, rect=)` where
-#'   `rect` is `list(x=, y=, width=, height=)`.
+#' @return A list of `Element` records, each `list(type=, text=, rect=,
+#'   page_rect=)` where `rect` is `list(x=, y=, width=, height=)`. `page_rect`
+#'   is the same rect with any text-matrix rotation resolved into an
+#'   axis-aligned page-space hull; identical to `rect` for upright runs.
 #' @export
 pdf_page_get_elements <- function(doc, page) {
   .Call(C_r_page_get_elements, doc, as.integer(page))
@@ -2801,6 +2803,18 @@ pdf_classify_page <- function(doc, page) {
 #' @param doc A `pdfoxide_document`.
 #' @export
 pdf_classify_document <- function(doc) .Call(C_r_doc_classify_document, doc)
+
+#' The document's structured diagnostics as a raw JSON array string (`"[]"`
+#' when there are none). Non-destructive. Each entry's `category` is an
+#' open-ended snake_case token -- tolerate tokens you do not know.
+#' @param doc A `pdfoxide_document`.
+#' @export
+pdf_structured_warnings <- function(doc) .Call(C_r_doc_structured_warnings, doc)
+
+#' As `pdf_structured_warnings()`, but drains: the returned entries are removed.
+#' @param doc A `pdfoxide_document`.
+#' @export
+pdf_take_structured_warnings <- function(doc) .Call(C_r_doc_take_structured_warnings, doc)
 
 # ── Header / footer / artifact removal ────────────────────────────────────────
 

@@ -1134,6 +1134,20 @@ public final class Document {
         return try takeString(
             pdf_document_classify_document(try ptr(), &code), code, "classifyDocument")
     }
+    /// The document's structured diagnostics as a raw JSON array ("[]" when
+    /// there are none). Non-destructive; `category` tokens are open-ended.
+    public func structuredWarnings() throws -> String {
+        var code: Int32 = 0
+        return try takeString(
+            pdf_document_structured_warnings(try ptr(), &code), code, "structuredWarnings")
+    }
+    /// As `structuredWarnings`, but drains: the returned entries are removed.
+    public func takeStructuredWarnings() throws -> String {
+        var code: Int32 = 0
+        return try takeString(
+            pdf_document_take_structured_warnings(try ptr(), &code), code,
+            "takeStructuredWarnings")
+    }
 
     // ── Final phase: header / footer / artifact removal ──────────────────────
 
@@ -3426,6 +3440,10 @@ public struct Element {
     public let type: String
     public let text: String
     public let rect: Bbox
+    /// Where the run physically sits on the page: `rect` with any text-matrix
+    /// rotation resolved into an axis-aligned page-space hull. Identical to
+    /// `rect` for upright runs.
+    public let pageRect: Bbox
     /// ISO 32000-1 §9.10.2 mapping-provenance label ("to_unicode"/"encoding"/
     /// "predefined_cmap"/"embedded_cmap"/"actual_text"/"fallback"), or nil when
     /// unknown. "fallback" means the text is a fabricated glyph-index echo, not
@@ -3460,6 +3478,8 @@ public final class ElementList {
             pdf_oxide_element_get_text(h, idx, &code), code, "ElementList.text")
         var x: Float = 0, y: Float = 0, w: Float = 0, hgt: Float = 0
         pdf_oxide_element_get_rect(h, idx, &x, &y, &w, &hgt, &code)
+        var px: Float = 0, py: Float = 0, pw: Float = 0, phgt: Float = 0
+        pdf_oxide_element_get_page_rect(h, idx, &px, &py, &pw, &phgt, &code)
         var pcode: Int32 = 0
         let provPtr = pdf_oxide_element_get_provenance(h, idx, &pcode)
         let provenance: String? =
@@ -3467,6 +3487,7 @@ public final class ElementList {
         return Element(
             type: type, text: text,
             rect: Bbox(x: Double(x), y: Double(y), width: Double(w), height: Double(hgt)),
+            pageRect: Bbox(x: Double(px), y: Double(py), width: Double(pw), height: Double(phgt)),
             provenance: provenance
         )
     }

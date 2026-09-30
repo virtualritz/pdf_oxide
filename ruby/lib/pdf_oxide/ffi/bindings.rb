@@ -1429,6 +1429,15 @@ module PdfOxide
       attach_function :pdf_oxide_crypto_set_policy, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
       attach_function :pdf_oxide_crypto_use_fips, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
       attach_function :pdf_oxide_element_count, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
+      # void pdf_oxide_element_get_page_rect(const FfiElementList *elements, int32_t index,
+      #                                      float *x, float *y, float *width, float *height,
+      #                                      int32_t *error_code)
+      # Page-space extents of the span: the rect from pdf_oxide_element_get_rect with any
+      # text-matrix rotation resolved into an axis-aligned page-space hull;
+      # identical to pdf_oxide_element_get_rect for upright runs.
+      attach_function :pdf_oxide_element_get_page_rect,
+                      %i[pointer int32 pointer pointer pointer pointer pointer], :void,
+                      blocking: false
       attach_function :pdf_oxide_element_get_rect, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
       attach_function :pdf_oxide_element_get_text, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
       attach_function :pdf_oxide_element_get_type, %i[pointer pointer pointer pointer pointer pointer pointer pointer], :pointer, blocking: false
@@ -1645,6 +1654,13 @@ module PdfOxide
       attach_function :pdf_document_extract_text_auto, %i[pointer int32 pointer], :pointer
       attach_function :pdf_document_extract_page_auto, %i[pointer int32 string pointer], :pointer
 
+      # Structured diagnostics — malloc'd JSON array of warning objects
+      # ("[]" when there are none); free with free_string.  `category` is
+      # an open-ended snake_case token: keep it a string and tolerate
+      # tokens this binding has never seen.  The `take_` variant drains.
+      attach_function :pdf_document_structured_warnings,      %i[pointer pointer], :pointer
+      attach_function :pdf_document_take_structured_warnings, %i[pointer pointer], :pointer
+
       # Models subsystem (#519 provisioning trio).
       attach_function :pdf_oxide_prefetch_models,    %i[string pointer], :pointer
       attach_function :pdf_oxide_model_manifest,     [],                  :pointer
@@ -1741,6 +1757,17 @@ module PdfOxide
                          int32 int32 int32
                          pointer size_t
                          pointer],
+                      :pointer
+
+      # uint8_t *pdf_get_rendered_image_data(
+      #   const FfiRenderedImage *img, int32_t *data_len, int32_t *error_code)
+      # Returns the encoded image bytes (PNG or JPEG per the format the
+      # image was rendered with). Caller-owned; free with free_bytes.
+      # Overrides the auto-generated 8-pointer placeholder declared
+      # earlier in this file — that placeholder signature does not match
+      # the real 3-argument ABI and cannot be called as-is.
+      attach_function :pdf_get_rendered_image_data,
+                      %i[pointer pointer pointer],
                       :pointer
     end
   end

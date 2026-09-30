@@ -750,7 +750,43 @@ pub fn detect_tables_from_spans(spans: &[TextSpan], config: &TableDetectionConfi
         return Vec::new();
     }
 
-    let mut columns = detect_columns(spans, config.column_tolerance, config.column_merge_threshold);
+    // The pitch cap is a REFINEMENT, so probe it the same way the finer
+    // text-edge lattice is probed below: adopt it only when the grid it
+    // produces still passes every emission gate, and otherwise keep the
+    // uncapped columns.
+    //
+    // Without that it is a cliff. Once the cap has split a page's columns,
+    // that column set is the only one tried; it either survives the gates or
+    // the page becomes prose, and nothing preserves the set that would have
+    // produced a table. Measured across the corpus, the cap moved 255 table
+    // pages to prose and 59 the other way — the same mechanism in both
+    // directions, so the gains were not evidence the rule was right.
+    let columns_uncapped =
+        detect_columns(spans, config.column_tolerance, config.column_merge_threshold, None);
+    let columns_capped =
+        detect_columns(spans, config.column_tolerance, config.column_merge_threshold, Some(config));
+    let mut columns = if columns_capped.len() == columns_uncapped.len() {
+        columns_capped
+    } else {
+        let probe_rows = detect_rows(spans, config.row_tolerance);
+        let capped_holds = probe_rows.len() >= 2
+            && columns_capped.len() >= config.min_table_columns.max(2)
+            && columns_capped.len() <= config.max_table_columns
+            && {
+                let g = assign_spans_to_cells(spans, &columns_capped, &probe_rows);
+                validate_table_structure_internal(&g, config) && {
+                    let t = grid_to_table(&g, spans, None);
+                    is_valid_table(&t)
+                        && passes_spatial_quality_gate(&t)
+                        && !looks_like_prose_paragraph(&t)
+                }
+            };
+        if capped_holds {
+            columns_capped
+        } else {
+            columns_uncapped
+        }
+    };
 
     // Greedy X-center clustering fragments a single logical cell whose
     // words are internally spaced (e.g. an agenda row "Receiving Dock
@@ -1036,6 +1072,7 @@ fn detect_columns(
     spans: &[TextSpan],
     column_tolerance: f32,
     merge_threshold: f32,
+    cap_to_pitch: Option<&TableDetectionConfig>,
 ) -> Vec<ColumnCluster> {
     // Sort span indices by X coordinate before clustering for deterministic results.
     let mut sorted_indices: Vec<usize> = (0..spans.len()).collect();
@@ -1072,12 +1109,90 @@ fn detect_columns(
     // Sort columns by center before merge pass.
     columns.sort_by(|a, b| crate::utils::safe_float_cmp(a.x_center, b.x_center));
 
+    // `merge_threshold` is a fixed absolute-point gap; on its own it breaks
+    // down as column count grows and the table's actual pitch shrinks (a
+    // dense numeric table with a 12pt column pitch has every adjacent pair
+    // fused by even a modest fixed threshold, collapsing distinct columns
+    // into one). Scale the *effective* threshold down for narrow-pitch
+    // tables by capping it at a fraction of the table's own median
+    // inter-column gap — same ratio-based pitch reasoning as
+    // `is_regular_lattice`'s on-pitch band (`[0.6, 1.6] * median`): a gap
+    // under `0.6 * median` is off-pitch-small relative to this table's own
+    // columns and should merge regardless of the fixed threshold, while a
+    // sparse table with few, widely-spaced columns keeps the full
+    // `merge_threshold` (no median signal to scale from).
+    //
+    // The premise is that the median gap is this table's pitch, so it has to
+    // hold before it is used. On a layout with no pitch -- most often prose the
+    // detector has mistaken for a table -- the median is the middle of a spread
+    // of unrelated gaps, and capping at 0.6 of it forbids merging fragments
+    // that are one column: a word is split from the number beside it
+    // (`Line 1` -> `Line` | `1`), and because neither half then matches the flow
+    // span it came from, the row is emitted a second time as prose.
+    //
+    // `is_regular_lattice` is the gate rather than the pitch test alone: that
+    // test tolerates two off-pitch gaps, which on a handful of columns is every
+    // gap it has, so it answers "yes" for any small irregular group. The
+    // lattice predicate carries the column-count floor that makes the tolerance
+    // mean something, and it is the same predicate this ratio was borrowed
+    // from, so the two stay in step.
+    // Measure the pitch on the columns that actually recur down the page, not
+    // on the greedy pre-merge clusters. Those clusters are one per distinct
+    // word-start x, so they include the running head, the page number, every
+    // indent level and every wrapped continuation: an indented legal index
+    // produced 13 of them where the table has 4 columns, and a leader-dot fee
+    // table 17 for 4. Their centres sit on a ~21-27 pt "pitch" that is just the
+    // average word-start spacing of prose, so the gate answered "lattice" about
+    // pages that have none, capped the merge threshold, and split the real
+    // columns apart until the emission gates rejected the page as prose.
+    //
+    // `detect_text_edge_columns` keeps only x edges recurring across several
+    // rows, which is what a column is. A dense numeric lattice still has those
+    // on a regular pitch, so the case this cap exists for keeps it; an indented
+    // index has too few to clear the lattice floor and keeps the fixed
+    // threshold.
+    // Cap the merge threshold to the table's own pitch, measured on the columns
+    // that actually recur down the page rather than on the greedy clusters
+    // built above. Those are one per distinct word-start x, so they include the
+    // running head, the page number, every indent level and every wrapped
+    // continuation: an indented legal index gave 13 of them where the table has
+    // 4 columns, a leader-dot fee table 17 for 4. Their centres sit on a
+    // ~21-27 pt "pitch" that is only the average word-start spacing of prose,
+    // so the gate said "lattice" about pages that have none, capped the
+    // threshold, split the real columns apart, and the emission gates then
+    // rejected the page as prose — 255 table pages lost across the corpus.
+    //
+    // `detect_text_edge_columns` keeps only x edges recurring across several
+    // rows, which is what a column is. A dense numeric lattice still has those
+    // on a regular pitch and keeps the cap; an indented index has too few to
+    // clear the lattice floor and keeps the fixed threshold.
+    let pitch_columns = cap_to_pitch
+        .map(|c| detect_text_edge_columns(spans, c))
+        .unwrap_or_default();
+    let effective_merge_threshold = if is_regular_lattice(&pitch_columns) {
+        let mut gaps: Vec<f32> = pitch_columns
+            .windows(2)
+            .map(|w| w[1].x_center - w[0].x_center)
+            .filter(|g| *g > 0.0)
+            .collect();
+        if gaps.is_empty() {
+            merge_threshold
+        } else {
+            gaps.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+            let median_gap = gaps[gaps.len() / 2];
+            merge_threshold.min(median_gap * 0.6)
+        }
+    } else {
+        merge_threshold
+    };
+
     // Post-clustering merge pass: merge adjacent columns whose centers are
     // within merge_threshold of each other or whose X ranges overlap.
     let mut merged: Vec<ColumnCluster> = Vec::new();
     for col in columns {
         let should_merge = merged.last().is_some_and(|prev: &ColumnCluster| {
-            (col.x_center - prev.x_center).abs() < merge_threshold || col.x_min <= prev.x_max
+            (col.x_center - prev.x_center).abs() < effective_merge_threshold
+                || col.x_min <= prev.x_max
         });
         if should_merge {
             let prev = merged.last_mut().unwrap();
@@ -1133,14 +1248,18 @@ fn is_numeric_cell(t: &str) -> bool {
 /// a numeric data lattice rather than prose that happened to align. Requires
 /// ≥5 columns and tolerates up to two off-pitch gaps (e.g. a wider row-label
 /// column at the left edge).
-fn is_regular_lattice(cols: &[ColumnCluster]) -> bool {
-    if cols.len() < 5 {
+/// Whether `gaps` describe a regular pitch: most of them sit in the
+/// `[0.6, 1.6] * median` band around their own median.
+///
+/// Both callers below reason from "this table has a pitch". That premise has
+/// to be checked before it is used: on an irregular layout the median is just
+/// the middle of a spread of unrelated gaps, and a band around it means
+/// nothing.
+fn gaps_are_on_pitch(gaps: &[f32]) -> bool {
+    if gaps.is_empty() {
         return false;
     }
-    let mut centers: Vec<f32> = cols.iter().map(|c| c.x_center).collect();
-    centers.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
-    let gaps: Vec<f32> = centers.windows(2).map(|w| w[1] - w[0]).collect();
-    let mut sorted = gaps.clone();
+    let mut sorted = gaps.to_vec();
     sorted.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
     let median = sorted[sorted.len() / 2];
     if median <= 0.0 {
@@ -1150,7 +1269,23 @@ fn is_regular_lattice(cols: &[ColumnCluster]) -> bool {
         .iter()
         .filter(|&&g| g >= median * 0.6 && g <= median * 1.6)
         .count();
-    on_pitch + 2 >= gaps.len()
+    // Proportional, not a fixed allowance. `on_pitch + 2 >= gaps.len()` means
+    // something different at every width: with 4 gaps it lets half of them be
+    // arbitrary, and with 30 it is nearly unreachable. A page then fell on one
+    // side of the gate or the other according to how many incidental x
+    // clusters it happened to carry — a running head, a page number, one
+    // wrapped line — rather than according to whether it is a lattice.
+    on_pitch * 5 >= gaps.len() * 4
+}
+
+fn is_regular_lattice(cols: &[ColumnCluster]) -> bool {
+    if cols.len() < 5 {
+        return false;
+    }
+    let mut centers: Vec<f32> = cols.iter().map(|c| c.x_center).collect();
+    centers.sort_by(|a, b| crate::utils::safe_float_cmp(*a, *b));
+    let gaps: Vec<f32> = centers.windows(2).map(|w| w[1] - w[0]).collect();
+    gaps_are_on_pitch(&gaps)
 }
 
 fn detect_text_edge_columns(
@@ -3534,17 +3669,15 @@ fn has_vertical_ruling_evidence(lines: &[crate::elements::PathContent], h_edges:
     })
 }
 
-/// Detect tables in regions bounded by horizontal rules (H-lines) when no vertical
-/// lines are present.  Groups H-edges by Y-position to find horizontal table
-/// boundaries, then runs text-edge detection on the spans within each bounded
-/// region.  This is the "H-lines define regions, text defines columns" hybrid.
-fn detect_tables_from_horizontal_rules(
-    spans: &[TextSpan],
-    h_edges: &[Edge],
-    config: &TableDetectionConfig,
-) -> Vec<Table> {
-    const MIN_RULE_WIDTH: f32 = 100.0;
-    const Y_SNAP: f32 = 4.0;
+/// Group wide H-edges into x-range-coherent FAMILIES, in emission order,
+/// so only rules that could bound the same table ever pair up. This fixes
+/// two failure shapes in one move: a page of scattered fraction bars never
+/// forms a family (no fake table from unrelated equation rules), and a
+/// decorative dashed border whose y-position interleaves a real table's
+/// rules lands in its own family instead of splitting the table's rules
+/// apart in the adjacent-pair walk (which silently dropped the table on
+/// real dash-boxed pages).
+fn x_coherent_rule_families<'a>(wide: &[&'a Edge]) -> Vec<Vec<&'a Edge>> {
     // A table's boundary rules line up: booktabs top/sub-header/bottom
     // rules share their x-range to within a point (overlap/union ≈ 1.0),
     // while unrelated wide strokes — displayed-equation fraction bars,
@@ -3553,23 +3686,6 @@ fn detect_tables_from_horizontal_rules(
     // differ). 0.85 splits the two populations with margin on both sides.
     const X_COHERENCE: f32 = 0.85;
 
-    // Keep only wide H-edges.
-    let wide: Vec<&Edge> = h_edges
-        .iter()
-        .filter(|e| (e.end - e.start) >= MIN_RULE_WIDTH)
-        .collect();
-    if wide.len() < 2 {
-        return Vec::new();
-    }
-
-    // Group the wide edges into x-range-coherent FAMILIES and window
-    // within each family, so only rules that could bound the same table
-    // ever pair up. This fixes two failure shapes in one move: a page of
-    // scattered fraction bars never forms a family (no fake table from
-    // unrelated equation rules), and a decorative dashed border whose
-    // y-position interleaves a real table's rules lands in its own family
-    // instead of splitting the table's rules apart in the adjacent-pair
-    // walk (which silently dropped the table on real dash-boxed pages).
     let mut uf = UnionFind::new(wide.len());
     for i in 0..wide.len() {
         for j in (i + 1)..wide.len() {
@@ -3581,13 +3697,54 @@ fn detect_tables_from_horizontal_rules(
             }
         }
     }
-    let mut families: HashMap<usize, Vec<&Edge>> = HashMap::new();
+    // Keyed by union-find root in a BTreeMap, not a HashMap: HashMap iteration
+    // order is randomized per process, and the sort below cannot recover from
+    // that on its own. Families are grouped by X-RANGE COHERENCE, so `coord`
+    // (the Y of a horizontal rule) is not unique across families — two rule
+    // families side by side, or a decorative border sharing a table's top-rule
+    // Y, tie on `a[0].coord`. `sort_by` is stable, so a tie leaves the input
+    // order intact, and with a HashMap that input order is per-process random:
+    // the two families then emit their tables in a different order each run,
+    // which reorders the rendered table blocks in the assembled page text.
+    // The BTreeMap makes the collected order deterministic; the root tiebreak
+    // makes the emitted order a total order over the families, so it depends
+    // only on page geometry and edge input order. Each family's `Vec` is pushed
+    // in ascending `wide` index order, so `a[0]` is still the family's first
+    // rule and non-tied pages sort exactly as before (byte-identical).
+    let mut families: std::collections::BTreeMap<usize, Vec<&'a Edge>> =
+        std::collections::BTreeMap::new();
     for (i, e) in wide.iter().enumerate() {
         families.entry(uf.find(i)).or_default().push(e);
     }
-    // Deterministic family order (HashMap iteration is randomized).
-    let mut families: Vec<Vec<&Edge>> = families.into_values().collect();
-    families.sort_by(|a, b| crate::utils::safe_float_cmp(a[0].coord, b[0].coord));
+    let mut families: Vec<(usize, Vec<&'a Edge>)> = families.into_iter().collect();
+    families.sort_by(|(root_a, a), (root_b, b)| {
+        crate::utils::safe_float_cmp(a[0].coord, b[0].coord).then_with(|| root_a.cmp(root_b))
+    });
+    families.into_iter().map(|(_root, f)| f).collect()
+}
+
+/// Detect tables in regions bounded by horizontal rules (H-lines) when no vertical
+/// lines are present.  Groups H-edges by Y-position to find horizontal table
+/// boundaries, then runs text-edge detection on the spans within each bounded
+/// region.  This is the "H-lines define regions, text defines columns" hybrid.
+fn detect_tables_from_horizontal_rules(
+    spans: &[TextSpan],
+    h_edges: &[Edge],
+    config: &TableDetectionConfig,
+) -> Vec<Table> {
+    const MIN_RULE_WIDTH: f32 = 100.0;
+    const Y_SNAP: f32 = 4.0;
+
+    // Keep only wide H-edges.
+    let wide: Vec<&Edge> = h_edges
+        .iter()
+        .filter(|e| (e.end - e.start) >= MIN_RULE_WIDTH)
+        .collect();
+    if wide.len() < 2 {
+        return Vec::new();
+    }
+
+    let families = x_coherent_rule_families(&wide);
 
     let mut tables = Vec::new();
 
@@ -3819,6 +3976,83 @@ pub fn detect_tables_with_lines(
     // Filter out invalid line-based tables BEFORE overlap checking so that
     // spurious line-based tables don't shadow valid text-based ones.
     final_tables.retain(is_valid_table);
+    // The intersection grid is built from closed cells, so a rule-bounded
+    // band whose rows are closed on only some sides never becomes a group.
+    // A booktabs table whose row-groups are separated by full-width rules,
+    // with hairlines between a few of its columns and a shaded last row per
+    // group, yields a grid for the groups whose shaded rows and hairlines
+    // close their cells — and nothing for a group's unshaded rows: they are
+    // bounded above and below by rules and crossed by the hairlines, but
+    // their outer cells have no side. The grid's own slice of that group is
+    // its one shaded row, which the section-divider split then isolates and
+    // the validity filter drops, so the group's rows fall to the prose flow
+    // while the two groups beside it read as tables.
+    //
+    // ISO 32000-1:2008 §14.8.4.3.4 (docs/spec/pdf.md:37805) makes a row the
+    // element that holds its cells, and a row-group bounded by rules is a
+    // run of such rows whether or not every cell is boxed. So the rule
+    // bands are read as well, with the detector the rules-only page uses,
+    // and a band's table is kept where no grid table already covers it.
+    if !final_tables.is_empty() {
+        // Rules only: a shaded row's rectangle contributes an edge too, and
+        // that edge would split a group's band at the shaded row.
+        let rules: Vec<crate::elements::PathContent> = lines
+            .iter()
+            .filter(|p| p.is_horizontal_line(2.0))
+            .cloned()
+            .collect();
+        let (mut h_edges, _) = extract_edges(&rules);
+        if h_edges.len() >= 2 {
+            snap_and_merge(&mut h_edges);
+            let mut banded = detect_tables_from_horizontal_rules(spans, &h_edges, config);
+            // Bands the grid already reads are dropped BEFORE adjacent
+            // bands are consolidated: every rule pair of the table is a
+            // band, and consolidating them first fuses the whole table into
+            // one fragment that overlaps a grid table and is thrown away
+            // with the group the grid missed.
+            // Covered means a grid table spans most of the BAND's height:
+            // the grid's one-row slice of a shaded row overlaps the band
+            // it was cut from, and must not count as reading it.
+            let covered = |band: &Table| {
+                let Some(bb) = band.bbox else { return true };
+                final_tables.iter().any(|t| {
+                    t.bbox.is_some_and(|lb| {
+                        let overlap = (lb.y + lb.height).min(bb.y + bb.height) - lb.y.max(bb.y);
+                        overlap > 0.5 * bb.height
+                            && lb.x < bb.x + bb.width
+                            && bb.x < lb.x + lb.width
+                    })
+                })
+            };
+            // And a band is read only where it continues a grid table:
+            // spanning most of THAT table's measure, and no more than a
+            // couple of rows away. A form's field labels sit between rules
+            // with no grid table beside them; a model summary's three lines
+            // sit under a layers table but cover a fifth of its width. A
+            // row-group of the same table runs its whole measure.
+            let continues_a_grid_table = |band: &Table| {
+                let Some(bb) = band.bbox else { return false };
+                final_tables.iter().any(|t| {
+                    t.bbox.is_some_and(|lb| {
+                        let x_overlap = (lb.x + lb.width).min(bb.x + bb.width) - lb.x.max(bb.x);
+                        let gap = if bb.y > lb.y + lb.height {
+                            bb.y - (lb.y + lb.height)
+                        } else {
+                            lb.y - (bb.y + bb.height)
+                        };
+                        x_overlap >= 0.8 * lb.width && gap <= 24.0
+                    })
+                })
+            };
+            banded.retain(|b| !covered(b) && continues_a_grid_table(b));
+            let row_h = median_fragment_row_height(&banded);
+            let y_tol = (row_h * 1.5).max(3.0);
+            banded = consolidate_adjacent_table_fragments_with_tol(banded, 2.0, y_tol);
+            banded.retain(|t| t.rows.len() >= 3);
+            banded.retain(is_valid_table);
+            final_tables.extend(banded);
+        }
+    }
 
     // Only allow text-based fallback if BOTH strategies permit it AND the caller
     // explicitly enabled text-only detection (config.text_fallback=true).
@@ -3968,7 +4202,22 @@ fn extract_cell_text(cell_span_indices: &[usize], spans: &[TextSpan]) -> String 
     if span_entries.len() == 1 {
         return span_entries.remove(0).2;
     }
-    span_entries.sort_by(|a, b| crate::utils::safe_float_cmp(b.0, a.0));
+    // Order the cell's members by row band, then left to right — the same
+    // comparator the reading-order passes use.
+    //
+    // The key used to be `bbox.center().y` descending with no x tiebreak. A
+    // centre moves with font size, so a raised marker in a smaller font (`*` at
+    // 4.98 pt beside body text at 7.98 pt) sorted to the FRONT of the cell
+    // while staying inside the line grouping, and the backward gap to the
+    // member now behind it produced no separator: `142.56 ± 59.19*^` read back
+    // as `59.19*^142.56 ±`.
+    //
+    // Keying on the baseline was tried before the glyph-width fix and had to be
+    // reverted; with widths taken from the measured offsets the geometry this
+    // sees is no longer distorted.
+    span_entries.sort_by(|a, b| {
+        crate::utils::row_aware_span_cmp(a.1.bbox.y, a.1.bbox.x, b.1.bbox.y, b.1.bbox.x)
+    });
 
     // Group into rows by y proximity, then within a row decide separator per
     // pair of spans using the same gap/CJK rules as inline text assembly.
@@ -4711,6 +4960,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }
     }
     fn make_h_line(x: f32, y: f32, width: f32) -> crate::elements::PathContent {
@@ -4948,8 +5199,12 @@ mod tests {
             create_test_span("$100", 600.0, 60.0, 50.0, 10.0),
         ];
         let config = TableDetectionConfig::default();
-        let columns =
-            detect_columns(&spans, config.column_tolerance, config.column_merge_threshold);
+        let columns = detect_columns(
+            &spans,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
         assert_eq!(
             columns.len(),
             4,
@@ -4970,12 +5225,95 @@ mod tests {
             create_test_span("F", 140.0, 60.0, 30.0, 10.0),
         ];
         let config = TableDetectionConfig::default();
-        let columns =
-            detect_columns(&spans, config.column_tolerance, config.column_merge_threshold);
+        let columns = detect_columns(
+            &spans,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
         assert_eq!(
             columns.len(),
             2,
             "Spans at x=130/135/140 should merge into 1 column, plus x=50 = 2 total, got {}",
+            columns.len()
+        );
+    }
+
+    /// The pitch-scaled cap must not fire on a layout that has no pitch.
+    ///
+    /// Six lines of `Word 1`-style prose: a label at a fixed left edge and a
+    /// short number just past it. The label widths differ, so the column
+    /// centres are spread irregularly and there is no pitch to scale to. The
+    /// cap applied anyway forbade merging the number into its label's column,
+    /// splitting `Line 1` into `Line` | `1`; the row then no longer matched the
+    /// flow span it came from and was emitted a second time as prose.
+    ///
+    /// Geometry is taken from a real page: labels at x=90 of widths 19, 43 and
+    /// 52, each followed by a ~6pt number about 3pt later.
+    #[test]
+    fn test_detect_columns_no_pitch_keeps_the_fixed_threshold() {
+        let mut spans = Vec::new();
+        for (row, (label, w)) in [
+            ("Line", 19.0f32),
+            ("Line", 19.0),
+            ("Line", 19.0),
+            ("Underline", 43.0),
+            ("BoldLine", 43.0),
+            ("ItalicLine", 52.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let y = 100.0 - row as f32 * 12.0;
+            spans.push(create_test_span(label, 90.0, y, *w, 10.0));
+            spans.push(create_test_span("1", 90.0 + w + 3.0, y, 6.0, 10.0));
+        }
+        let config = TableDetectionConfig::default();
+        let columns = detect_columns(
+            &spans,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
+        assert!(
+            columns.len() <= 2,
+            "an irregular label/number layout has no pitch to scale to, so the \
+             fixed merge threshold must still join each number to its label; \
+             got {} columns",
+            columns.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_columns_dense_pitch_stays_distinct() {
+        // A dense numeric table: 6 columns on a 20pt pitch, each column's
+        // spans sharing an exact left-x (so the *first* clustering pass,
+        // gated on column_tolerance=15, keeps every column separate — this
+        // isolates the merge-threshold pass specifically). Under the
+        // default config's *fixed* 25pt column_merge_threshold, every
+        // adjacent 20pt gap is below the threshold, so the old code fused
+        // all 6 into 1. The threshold must scale down with this table's own
+        // (much smaller than 25pt) pitch so the columns survive distinct.
+        let mut spans = Vec::new();
+        for row in 0..3 {
+            let y = 100.0 - row as f32 * 20.0;
+            for col in 0..6 {
+                let x = 20.0 + col as f32 * 20.0;
+                spans.push(create_test_span("9", x, y, 8.0, 10.0));
+            }
+        }
+        let config = TableDetectionConfig::default();
+        let columns = detect_columns(
+            &spans,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
+        assert_eq!(
+            columns.len(),
+            6,
+            "a 20pt-pitch dense table must keep all 6 columns distinct \
+             despite the 25pt fixed merge_threshold, got {}",
             columns.len()
         );
     }
@@ -5000,10 +5338,18 @@ mod tests {
             create_test_span("A", 50.0, 100.0, 30.0, 10.0),
         ];
         let config = TableDetectionConfig::default();
-        let cols_ordered =
-            detect_columns(&spans_ordered, config.column_tolerance, config.column_merge_threshold);
-        let cols_reversed =
-            detect_columns(&spans_reversed, config.column_tolerance, config.column_merge_threshold);
+        let cols_ordered = detect_columns(
+            &spans_ordered,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
+        let cols_reversed = detect_columns(
+            &spans_reversed,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
         assert_eq!(
             cols_ordered.len(),
             cols_reversed.len(),
@@ -5033,7 +5379,7 @@ mod tests {
             create_test_span("C", 10.0, 80.0, 30.0, 10.0),
             create_test_span("D", 50.0, 80.0, 30.0, 10.0),
         ];
-        let columns = detect_columns(&spans, 15.0, 25.0);
+        let columns = detect_columns(&spans, 15.0, 25.0, Some(&TableDetectionConfig::default()));
         let rows = detect_rows(&spans, 2.8);
         let grid = assign_spans_to_cells(&spans, &columns, &rows);
         let header = detect_header_row(&grid, &spans);
@@ -5461,6 +5807,82 @@ mod tests {
         assert_eq!(edges.len(), 1, "Segments at near-identical coords should snap and join");
         assert!((edges[0].start - 36.0).abs() < 0.01, "Joined edge should start at 36");
         assert!((edges[0].end - 170.0).abs() < 0.01, "Joined edge should end at 170");
+    }
+
+    #[test]
+    fn rule_families_tied_on_first_coord_emit_in_input_order() {
+        // Eight side-by-side families (disjoint x-ranges, so none unify),
+        // every family's first rule at the same y: `a[0].coord` ties across
+        // all of them, so only the root tiebreak orders the output. Under
+        // the pre-fix HashMap grouping this order was per-process hash
+        // order (8! arrangements), so this assertion fails on all but the
+        // seed that happens to sort.
+        let edges: Vec<Edge> = (0..8)
+            .flat_map(|k| {
+                let x0 = 200.0 * k as f32;
+                [
+                    Edge {
+                        coord: 700.0,
+                        start: x0,
+                        end: x0 + 150.0,
+                    },
+                    Edge {
+                        coord: 600.0,
+                        start: x0,
+                        end: x0 + 150.0,
+                    },
+                ]
+            })
+            .collect();
+        let wide: Vec<&Edge> = edges.iter().collect();
+
+        let families = x_coherent_rule_families(&wide);
+
+        assert_eq!(families.len(), 8, "Disjoint x-ranges should stay separate families");
+        for (k, family) in families.iter().enumerate() {
+            assert_eq!(family.len(), 2);
+            assert!((family[0].coord - 700.0).abs() < 0.01, "First rule should be the top rule");
+            assert!(
+                (family[0].start - 200.0 * k as f32).abs() < 0.01,
+                "Tied families should emit in input order, family {k} out of place"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_families_with_distinct_first_coords_order_by_coord() {
+        // Distinct `a[0].coord` values: the coord key alone decides, so the
+        // input (and root) order must NOT leak through — the family given
+        // second sorts first because its top rule has the smaller y.
+        let edges = [
+            Edge {
+                coord: 500.0,
+                start: 0.0,
+                end: 150.0,
+            },
+            Edge {
+                coord: 400.0,
+                start: 0.0,
+                end: 150.0,
+            },
+            Edge {
+                coord: 300.0,
+                start: 300.0,
+                end: 450.0,
+            },
+            Edge {
+                coord: 200.0,
+                start: 300.0,
+                end: 450.0,
+            },
+        ];
+        let wide: Vec<&Edge> = edges.iter().collect();
+
+        let families = x_coherent_rule_families(&wide);
+
+        assert_eq!(families.len(), 2);
+        assert!((families[0][0].coord - 300.0).abs() < 0.01);
+        assert!((families[1][0].coord - 500.0).abs() < 0.01);
     }
 
     #[test]
@@ -5983,8 +6405,12 @@ mod tests {
             ..TableDetectionConfig::default()
         };
 
-        let greedy_cols =
-            detect_columns(&spans, config.column_tolerance, config.column_merge_threshold);
+        let greedy_cols = detect_columns(
+            &spans,
+            config.column_tolerance,
+            config.column_merge_threshold,
+            Some(&config),
+        );
         // With tight tolerance + scattered spans, greedy should exceed 6.
         assert!(
             greedy_cols.len() > 6,
@@ -7219,6 +7645,8 @@ mod tests {
             rotation_degrees: 0.0,
             wmode: 0,
             rtl_draw_logical: false,
+            mirrored: false,
+            page_rotation_applied: 0,
         }
     }
 

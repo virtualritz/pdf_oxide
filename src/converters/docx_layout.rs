@@ -488,17 +488,17 @@ fn build_document_body(pages: &[PageSpans], page_w_pt: f32, page_h_pt: f32) -> S
                 }
 
                 let sz_half_pt = (span.font_size * 2.0).round() as i32;
-                let color_hex = if span.color.r == 0.0 && span.color.g == 0.0 && span.color.b == 0.0
-                {
-                    String::new()
-                } else {
-                    format!(
-                        "<w:color w:val=\"{:02X}{:02X}{:02X}\"/>",
-                        (span.color.r * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (span.color.g * 255.0).round().clamp(0.0, 255.0) as u8,
-                        (span.color.b * 255.0).round().clamp(0.0, 255.0) as u8,
-                    )
-                };
+                let color_hex =
+                    if crate::color::is_document_black(span.color.r, span.color.g, span.color.b) {
+                        String::new()
+                    } else {
+                        format!(
+                            "<w:color w:val=\"{:02X}{:02X}{:02X}\"/>",
+                            (span.color.r * 255.0).round().clamp(0.0, 255.0) as u8,
+                            (span.color.g * 255.0).round().clamp(0.0, 255.0) as u8,
+                            (span.color.b * 255.0).round().clamp(0.0, 255.0) as u8,
+                        )
+                    };
                 let bold = if span.font_weight.is_bold() {
                     "<w:b/><w:bCs/>"
                 } else {
@@ -739,9 +739,14 @@ fn annotate_heading_levels(spans: &mut [crate::layout::text_block::TextSpan]) {
         let key = (s.font_size * 10.0).round() as i32;
         *buckets.entry(key).or_default() += 1;
     }
+    // Explicit tie-break, not `max_by_key`: it returns the LAST maximal
+    // element, and over a `HashMap` that is the per-process-randomized
+    // iteration order, so a page whose two font sizes carry equal span counts
+    // picked a different modal body size per process — which flips the
+    // heading/body ratio test below. Ties resolve to the smaller size.
     let body_size_tenth = buckets
         .iter()
-        .max_by_key(|(_, c)| *c)
+        .max_by(|(a_key, a_c), (b_key, b_c)| a_c.cmp(b_c).then_with(|| b_key.cmp(a_key)))
         .map(|(k, _)| *k)
         .unwrap_or(120);
     let body = (body_size_tenth as f32) / 10.0;
@@ -937,4 +942,63 @@ fn escape_xml(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod heading_level_tests {
+    use super::*;
+
+    fn span(text: &str, size: f32) -> TextSpan {
+        TextSpan {
+            text: text.to_string(),
+            font_size: size,
+            ..Default::default()
+        }
+    }
+
+    /// The modal-body-size histogram inside `annotate_heading_levels` ties
+    /// 3-to-3 between 10 pt and 20 pt. `max_by_key` over the backing
+    /// `HashMap` returned whichever bucket the per-process-randomized
+    /// iteration order visited last, so the body size — and therefore every
+    /// heading/body ratio — flapped between runs. The tie must resolve to the
+    /// SMALLER size (10 pt), which makes the 20 pt spans ratio-2.0 H1s. Had
+    /// it resolved to 20 pt, those same spans would be ratio-1.0 body text
+    /// and get no heading level at all.
+    #[test]
+    fn modal_body_size_tie_resolves_to_smaller_size() {
+        let mut spans = vec![
+            span("Chapter One", 20.0),
+            span("Chapter Two", 20.0),
+            span("Chapter Three", 20.0),
+            span("Some body text", 10.0),
+            span("More body text", 10.0),
+            span("Further body text", 10.0),
+        ];
+        annotate_heading_levels(&mut spans);
+        for s in spans.iter().take(3) {
+            assert_eq!(
+                s.heading_level,
+                Some(1),
+                "20 pt span against a 10 pt body must be an H1: {:?}",
+                s.text
+            );
+        }
+        for s in spans.iter().skip(3) {
+            assert_eq!(s.heading_level, None, "body-size span must not be a heading: {:?}", s.text);
+        }
+    }
+
+    /// The tie-break must not disturb the ordinary case: a clear modal size
+    /// stays the body size regardless of the tie direction.
+    #[test]
+    fn unique_modal_body_size_is_unaffected_by_tie_break() {
+        let mut spans = vec![
+            span("Chapter One", 20.0),
+            span("Some body text", 10.0),
+            span("More body text", 10.0),
+            span("Further body text", 10.0),
+        ];
+        annotate_heading_levels(&mut spans);
+        assert_eq!(spans[0].heading_level, Some(1));
+    }
 }

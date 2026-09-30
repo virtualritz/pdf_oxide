@@ -1,7 +1,7 @@
 Package: pdfoxide
 Type: Package
 Title: Fast PDF Text, Markdown and HTML Extraction (pdf_oxide)
-Version: 0.3.77
+Version: 0.3.78
 Authors@R: person("Yury", "Fedoseev", email = "yfedoseev@gmail.com", role = c("aut", "cre"))
 Author: Yury Fedoseev [aut, cre]
 Maintainer: Yury Fedoseev <yfedoseev@gmail.com>
@@ -14,4 +14,4 @@ License: MIT + file LICENSE
 URL: https://github.com/yfedoseev/pdf_oxide
 Encoding: UTF-8
 Suggests: tinytest
-Config/roxygen2/version: 8.0.0
+Config/roxygen2/version: 8.1.0

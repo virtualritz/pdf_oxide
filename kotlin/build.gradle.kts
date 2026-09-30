@@ -7,16 +7,16 @@
 // The JNI library is loaded by the Java NativeLoader via System.loadLibrary or
 // the `-Dfyi.oxide.pdf.lib.path=<libpdf_oxide_jni.so>` override.
 plugins {
-    kotlin("jvm") version "2.2.20"
+    kotlin("jvm") version "2.4.10"
     `java-library`
     id("io.gitlab.arturbosch.detekt") version "1.23.8"
     // Publishing to Maven Central via the post-OSSRH Sonatype Central Portal
     // (mirrors the Java binding's central-publishing-maven-plugin setup).
-    id("com.vanniktech.maven.publish") version "0.30.0"
+    id("com.vanniktech.maven.publish") version "0.37.0"
 }
 
 group = "fyi.oxide"
-version = "0.3.77"
+version = "0.3.78"
 
 repositories {
     // mavenLocal first so a freshly `mvn install`-ed Java artifact (dev/CI)
@@ -40,7 +40,7 @@ detekt {
 dependencies {
     // The Java binding owns the JNI bridge; we re-export its types (api scope)
     // so Kotlin callers `import fyi.oxide.pdf.*` and get them transitively.
-    api("fyi.oxide:pdf-oxide:0.3.77")
+    api("fyi.oxide:pdf-oxide:0.3.78")
     testImplementation(kotlin("test"))
 }
 
@@ -62,9 +62,18 @@ tasks.test {
 // Maven Central publishing (Sonatype Central Portal). Credentials + signing key
 // come from CI env (ORG_GRADLE_PROJECT_mavenCentralUsername / *Password /
 // signingInMemoryKey / *Password), same secrets family as the Java binding.
-// GPG-signs all publications; autoPublish is left to the release-gate workflow.
+// GPG-signs all publications. The host argument is gone from the plugin:
+// post-OSSRH there is only the Central Portal, so `publishToMavenCentral()`
+// targets it unconditionally.
+//
+// `automaticRelease = true` matches the Java binding's `<autoPublish>true` and
+// every other registry this project publishes to. With `false`, the tag job
+// succeeded while leaving the deployment VALIDATED in the Portal for a human
+// to release by hand — and since v0.3.69 nobody ever did, so
+// `fyi.oxide:pdf-oxide-kotlin` has never existed on Central. The release gate
+// is the tag, not a second click.
 mavenPublishing {
-    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL, automaticRelease = false)
+    publishToMavenCentral(automaticRelease = true)
     signAllPublications()
     coordinates("fyi.oxide", "pdf-oxide-kotlin", version.toString())
     pom {

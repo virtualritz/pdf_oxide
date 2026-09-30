@@ -9,7 +9,7 @@
 
 /// Binding version, kept in lock-step with the workspace crate by
 /// scripts/sync_version.py (the single source of truth is Cargo.toml).
-#define POX_PDF_OXIDE_VERSION "0.3.77"
+#define POX_PDF_OXIDE_VERSION "0.3.78"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -380,6 +380,11 @@ typedef struct {
                                 error:(NSError**)error;
 - (nullable NSString*)classifyPage:(NSInteger)page error:(NSError**)error;
 - (nullable NSString*)classifyDocumentWithError:(NSError**)error;
+/// Structured diagnostics as a raw JSON array string (`"[]"` when there are
+/// none). Non-destructive; `category` tokens are open-ended.
+- (nullable NSString*)structuredWarningsWithError:(NSError**)error;
+/// As `structuredWarningsWithError:`, but drains the returned entries.
+- (nullable NSString*)takeStructuredWarningsWithError:(NSError**)error;
 
 // ── Header / footer / artifact removal ───────────────────────────────────────
 - (int32_t)eraseHeader:(NSInteger)page error:(NSError**)error;
@@ -706,6 +711,11 @@ typedef struct {
 - (nullable NSString*)provenanceAtIndex:(int32_t)index error:(NSError**)error;
 /// The element bounding box at `index`.
 - (POXBbox)rectAtIndex:(int32_t)index error:(NSError**)error;
+/// The page-space extents of the element at `index`: the rect from
+/// -rectAtIndex:error: with any text-matrix rotation resolved into an
+/// axis-aligned page-space hull. Identical to -rectAtIndex:error: for upright
+/// runs.
+- (POXBbox)pageRectAtIndex:(int32_t)index error:(NSError**)error;
 /// Serialize the whole list to JSON (nil on error).
 - (nullable NSString*)toJsonWithError:(NSError**)error;
 

@@ -1182,6 +1182,8 @@ class _Native {
             'pdf_oxide_element_get_provenance'),
         elementGetRect = lib.lookupFunction<_ElemRectC, _ElemRectD>(
             'pdf_oxide_element_get_rect'),
+        elementGetPageRect = lib.lookupFunction<_ElemRectC, _ElemRectD>(
+            'pdf_oxide_element_get_page_rect'),
         elementsFree = lib
             .lookupFunction<_ListFreeC, _ListFreeD>('pdf_oxide_elements_free'),
         elementsToJson = lib.lookupFunction<_ElemJsonC, _ElemJsonD>(
@@ -1224,6 +1226,10 @@ class _Native {
             lib.lookupFunction<_TextC, _TextD>('pdf_document_classify_page'),
         classifyDocument = lib.lookupFunction<_TextAllC, _TextAllD>(
             'pdf_document_classify_document'),
+        structuredWarnings = lib.lookupFunction<_TextAllC, _TextAllD>(
+            'pdf_document_structured_warnings'),
+        takeStructuredWarnings = lib.lookupFunction<_TextAllC, _TextAllD>(
+            'pdf_document_take_structured_warnings'),
         // furniture
         eraseHeader = lib.lookupFunction<_DeI32I32C, _DeI32I32D>(
             'pdf_document_erase_header'),
@@ -1695,6 +1701,7 @@ class _Native {
   final _ListStrD elementGetText;
   final _ListStrD elementGetProvenance;
   final _ElemRectD elementGetRect;
+  final _ElemRectD elementGetPageRect;
   final _ListFreeD elementsFree;
   final _ElemJsonD elementsToJson;
   final _AddTimestampD addTimestamp;
@@ -1709,6 +1716,8 @@ class _Native {
   final _TextD extractTextAuto, classifyPage;
   final _TextAllD extractAllText,
       classifyDocument,
+      structuredWarnings,
+      takeStructuredWarnings,
       getOutline,
       getPageLabels,
       getXmpMetadata;
@@ -3787,6 +3796,33 @@ class PdfDocument implements Finalizable {
     try {
       return _takeString(
           _n.classifyDocument(_handle, code), code.value, 'classifyDocument');
+    } finally {
+      calloc.free(code);
+    }
+  }
+
+  /// The document's structured diagnostics as a raw JSON array (`'[]'` when
+  /// there are none). Non-destructive: a later call returns the same entries
+  /// plus any raised since. Each entry's `category` is an open-ended
+  /// snake_case token — tolerate tokens you do not know.
+  String structuredWarnings() {
+    _check();
+    final code = calloc<Int32>();
+    try {
+      return _takeString(_n.structuredWarnings(_handle, code), code.value,
+          'structuredWarnings');
+    } finally {
+      calloc.free(code);
+    }
+  }
+
+  /// As [structuredWarnings], but drains: the returned entries are removed.
+  String takeStructuredWarnings() {
+    _check();
+    final code = calloc<Int32>();
+    try {
+      return _takeString(_n.takeStructuredWarnings(_handle, code), code.value,
+          'takeStructuredWarnings');
     } finally {
       calloc.free(code);
     }
@@ -7351,7 +7387,8 @@ class OcrEngine implements Finalizable {
 
 /// A single layout element read from an [ElementList].
 class Element {
-  const Element(this.type, this.text, this.rect, [this.provenance = '']);
+  const Element(this.type, this.text, this.rect, this.pageRect,
+      [this.provenance = '']);
 
   /// The element type label (e.g. `Text`, `Image`, `Table`).
   final String type;
@@ -7361,6 +7398,13 @@ class Element {
 
   /// The element's bounding box in page user-space points.
   final Bbox rect;
+
+  /// Page-space extents of the span: [rect] with any text-matrix rotation
+  /// resolved into an axis-aligned page-space hull.
+  ///
+  /// A caller highlighting or redacting a sideways word gets the rectangle the
+  /// word occupies on the page. Identical to [rect] for upright runs.
+  final Bbox pageRect;
 
   /// ISO 32000-1 §9.10.2 mapping-provenance label (`to_unicode`/`encoding`/
   /// `predefined_cmap`/`embedded_cmap`/`actual_text`/`fallback`), or `''` when
@@ -7428,8 +7472,13 @@ class ElementList implements Finalizable {
     try {
       _n.elementGetRect(_handle, index, x, y, w, h, code);
       if (code.value != 0) throw PdfOxideError(code.value, 'elementGetRect');
-      return Element(
-          type, text, Bbox(x.value, y.value, w.value, h.value), provenance);
+      final rect = Bbox(x.value, y.value, w.value, h.value);
+      _n.elementGetPageRect(_handle, index, x, y, w, h, code);
+      if (code.value != 0) {
+        throw PdfOxideError(code.value, 'elementGetPageRect');
+      }
+      final pageRect = Bbox(x.value, y.value, w.value, h.value);
+      return Element(type, text, rect, pageRect, provenance);
     } finally {
       calloc.free(x);
       calloc.free(y);

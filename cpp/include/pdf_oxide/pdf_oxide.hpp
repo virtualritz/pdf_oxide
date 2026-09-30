@@ -176,6 +176,10 @@ struct Element {
     std::string type;
     std::string text;
     Bbox rect;
+    /// Page-space extents of the span: `rect` with any text-matrix rotation
+    /// resolved into an axis-aligned page-space hull. Identical to `rect` for
+    /// upright runs.
+    Bbox page_rect;
     /// ISO 32000-1 §9.10.2 mapping-provenance label ("to_unicode"/"encoding"/
     /// "predefined_cmap"/"embedded_cmap"/"actual_text"/"fallback"), or empty
     /// when unknown. "fallback" means the text is a fabricated glyph-index echo,
@@ -933,6 +937,10 @@ class Document {
                 pdf_oxide_element_get_rect(list, i, &b.x, &b.y, &b.width, &b.height,
                                            &code);
                 e.rect = b;
+                Bbox pb{0, 0, 0, 0};
+                pdf_oxide_element_get_page_rect(list, i, &pb.x, &pb.y, &pb.width,
+                                                &pb.height, &code);
+                e.page_rect = pb;
                 out.push_back(std::move(e));
             }
         } catch (...) {
@@ -1058,6 +1066,22 @@ class Document {
         int32_t code = 0;
         return detail::take_string(pdf_document_classify_document(ptr(), &code), code,
                                    "Document::classify_document");
+    }
+
+    /// The document's structured diagnostics as a raw JSON array ("[]" when
+    /// there are none). Non-destructive. Each entry's `category` is an
+    /// open-ended snake_case token — tolerate tokens you do not know.
+    std::string structured_warnings() const {
+        int32_t code = 0;
+        return detail::take_string(pdf_document_structured_warnings(ptr(), &code), code,
+                                   "Document::structured_warnings");
+    }
+
+    /// As `structured_warnings`, but drains: the returned entries are removed.
+    std::string take_structured_warnings() const {
+        int32_t code = 0;
+        return detail::take_string(pdf_document_take_structured_warnings(ptr(), &code),
+                                   code, "Document::take_structured_warnings");
     }
 
     // ── PHASE-8: header / footer / artifact removal ──────────────────────────
