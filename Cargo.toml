@@ -301,7 +301,7 @@ qrcode = { version = "0.14", optional = true }
 barcoders = { version = "2.0", optional = true, features = ["image"] }
 
 # Office document creation and export via office_oxide (always required)
-office_oxide = { version = "0.1.9", default-features = false }
+office_oxide = { version = "0.1.12", default-features = false }
 ureq = { version = "3", default-features = false, features = ["rustls"], optional = true }
 
 # `getrandom`'s `wasm_js` backend is only meaningful when targeting
