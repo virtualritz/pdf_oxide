@@ -252,32 +252,23 @@ impl ObjectSerializer {
 
     /// Write a PDF name.
     ///
-    /// Names start with `/` and escape special characters with `#xx`.
+    /// Names start with `/` and escape special characters with `#xx`. The
+    /// delimiter characters `( ) < > [ ] { } / %` all have to be escaped, as do
+    /// `#` itself and anything outside printable ASCII. Written literally, `(`
+    /// in particular ends the name early and the rest of the dictionary is then
+    /// read as garbage.
     fn write_name<W: Write>(&self, w: &mut W, name: &str) -> std::io::Result<()> {
-        write!(w, "/")?;
+        w.write_all(b"/")?;
         for byte in name.bytes() {
-            match byte {
-                // Regular characters (no escaping needed)
-                b'!'
-                | b'"'
-                | b'$'..=b'&'
-                | b'\''..=b'.'
-                | b'0'..=b'9'
-                | b';'
-                | b'<'
-                | b'>'
-                | b'?'
-                | b'@'
-                | b'A'..=b'Z'
-                | b'^'..=b'z'
-                | b'|'
-                | b'~' => {
-                    w.write_all(&[byte])?;
-                },
-                // Characters that need escaping
-                _ => {
-                    write!(w, "#{:02X}", byte)?;
-                },
+            let regular = (0x21..=0x7E).contains(&byte)
+                && !matches!(
+                    byte,
+                    b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%' | b'#'
+                );
+            if regular {
+                w.write_all(&[byte])?;
+            } else {
+                write!(w, "#{byte:02X}")?;
             }
         }
         Ok(())
