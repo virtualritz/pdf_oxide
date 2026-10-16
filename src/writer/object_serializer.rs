@@ -594,6 +594,21 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_name_escapes_delimiters() {
+        let s = ObjectSerializer::new();
+        // `( ) < > %` are delimiters. Written literally they end a name early or
+        // open a string, so they have to travel as `#xx`.
+        assert_eq!(
+            s.serialize_to_string(&Object::Name("Ihre (bitte) unterschreiben".to_string())),
+            "/Ihre#20#28bitte#29#20unterschreiben"
+        );
+        assert_eq!(
+            s.serialize_to_string(&Object::Name("a<b>c%d".to_string())),
+            "/a#3Cb#3Ec#25d"
+        );
+    }
+
+    #[test]
     fn test_serialize_array() {
         let s = ObjectSerializer::compact();
         let arr = Object::Array(vec![Object::Integer(1), Object::Integer(2), Object::Integer(3)]);
