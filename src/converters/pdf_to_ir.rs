@@ -191,11 +191,7 @@ pub fn pdf_to_ir(
     };
     populate_metadata_from_pdf_info(doc, &mut metadata);
 
-    Ok(DocumentIR {
-        metadata,
-        sections,
-        defined_names: Vec::new(),
-    })
+    Ok(DocumentIR { metadata, sections })
 }
 
 /// Pull `/Title`, `/Author`, `/Subject`, `/Keywords`, `/Creator`,
